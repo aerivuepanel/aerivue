@@ -1147,42 +1147,77 @@ Select a category:"""
 
     # ==================== ORDER (wallet-gated, markup-aware) ====================
 
-    async def order_now_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def order_now_callback(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ):
         """
-        Start the existing order flow from the Services "Order Now" button.
+        Order Now button.
 
-        Unlike normal inline-button flows, this intentionally does NOT call
-        self.render() because render() edits/deletes the message that owns
-        the callback. The Services message must remain untouched.
-
-        We reuse the same order state used by /order, but send the first
-        order prompt as a NEW Telegram message. The literal /order command
-        is never sent into the chat.
+        IMPORTANT:
+        - Services message remains untouched.
+        - No edit.
+        - No delete.
+        - Starts the same order state as /order.
+        - Sends a NEW order-flow message.
+        - Never sends the literal /order command.
         """
+
         query = update.callback_query
+
+        # Always acknowledge the button click first.
         await query.answer()
 
-        # Start clean if the user previously abandoned an order.
+        # Start a completely fresh order session.
         for key in (
-            'order_step',
-            'order_service',
-            'order_link',
-            'order_confirm',
+            "order_step",
+            "order_service",
+            "order_link",
+            "order_confirm",
         ):
             context.user_data.pop(key, None)
 
-        # Exactly the same first state as the manual /order command.
-        context.user_data['order_step'] = 'service_id'
+    # Same state used by manual /order.
+        context.user_data["order_step"] = "service_id"
 
-        # IMPORTANT: send a NEW message. Do not use self.render() here.
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"{pe('📦')} <b>New Order</b>\n\n"
-                f"Enter Service ID (use /services to find):"
-            ),
-            parse_mode=ParseMode.HTML,
+        order_text = (
+            f"{pe('📦')} <b>New Order</b>\n\n"
+            f"Enter Service ID (use /services to find):"
         )
+
+        try:
+            # IMPORTANT:
+        # reply_text() SENDS A NEW MESSAGE.
+        #
+        # It does NOT edit the Services message.
+        # It does NOT delete the Services message.
+            await query.message.reply_text(
+                text=order_text,
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Order Now: failed to send new order message: %s",
+                exc
+            )
+
+        # The order state is already active, but inform the user
+        # if Telegram failed to send the prompt.
+            try:
+                await query.message.reply_text(
+                    text=(
+                        f"{pe('ℹ️')} <b>Order flow started</b>\n\n"
+                        f"Please enter the Service ID:"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as retry_exc:
+                logger.exception(
+                    "Order Now: retry message also failed: %s",
+                    retry_exc
+                )
 
     async def order_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['order_step'] = 'service_id'
