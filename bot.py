@@ -1,3 +1,42 @@
+# DEMON_SMM_BOT_RAZORPAY.py - No-Delete UX + Razorpay Dynamic UPI QR + Auto Credit
+#
+# CHANGES IN THIS VERSION (per feedback):
+#
+# 1. DELETE-MESSAGE UX REMOVED ENTIRELY
+#    - The old "delete previous message, send new one" single-screen pattern was
+#      the whole source of the recurring bugs (order flow, no-button screens,
+#      /start twice, etc. all got tangled in it). It's gone now — every render()
+#      call just sends a plain new message, like a normal bot conversation.
+#      Nothing gets deleted, ever. /start twice now simply posts two menus, each
+#      fully independent, exactly as asked.
+#
+# 2. <tg-emoji> RAW TAG FALLBACK (kept from v4)
+#    - If Telegram rejects an HTML send (e.g. an invalid custom emoji id), the
+#      fallback strips tags via strip_html() instead of leaking raw markup.
+#
+# 3. HEALTH-CHECK PORT (for host platforms that need an open port to keep the
+#    process alive, e.g. Render/Railway free tiers)
+#    - A tiny background HTTP server binds PORT (env var, default 8080) and
+#      replies "Bot is running" on GET / — separate from Telegram polling, which
+#      still runs via run_polling() as before.
+#
+# 4. ADMIN ALERT ON ORDER FAILURE
+#    - If the panel API rejects an order (e.g. panel balance too low), the admin
+#      now gets a DM with the user, service, quantity, and the panel's raw error
+#      — flagged with a ⚠️ if the error text mentions "balance".
+#
+# 5. @aerivue CHANNEL POSTS
+#    - New user starting the bot for the first time -> a "new user joined" post.
+#    - Every successful order -> a "new order" post (user + service + quantity;
+#      wallet cost is deliberately left out of the public post to keep margin
+#      private — say the word if you want the amount shown too).
+#    - Set CHANNEL_ID env var (default "@aerivue"). The bot must be an admin of
+#      that channel or these posts will silently fail (logged, not crash).
+#
+# MongoDB (motor) + reseller tiered markup pricing kept as in v4.
+#
+# pip install python-telegram-bot==22.7 requests motor pymongo --break-system-packages
+
 import io
 import os
 import json
@@ -25,7 +64,6 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes,
 )
 from telegram.constants import ParseMode
-
 
 # ==================== PREMIUM EMOJIS ====================
 # NOTE: these ids must be custom emoji ids your bot actually has access to.
