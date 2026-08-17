@@ -1,14 +1,8 @@
-# DEMON_SMM_BOT_RAZORPAY.py - No-Delete UX + Razorpay Dynamic UPI QR + Auto Credit
+# DEMON_SMM_BOT_RAZORPAY_PAYMENTLINK.py - Button UI edit + command history + auto payment
 #
-# CHANGES IN THIS VERSION (per feedback):
-#
-# 1. DELETE-MESSAGE UX REMOVED ENTIRELY
-#    - The old "delete previous message, send new one" single-screen pattern was
-#      the whole source of the recurring bugs (order flow, no-button screens,
-#      /start twice, etc. all got tangled in it). It's gone now — every render()
-#      call just sends a plain new message, like a normal bot conversation.
-#      Nothing gets deleted, ever. /start twice now simply posts two menus, each
-#      fully independent, exactly as asked.
+# UX: inline-button flows keep ONE UI message (edit it, or delete/replace only when
+# Telegram requires a media-type change). Commands and normal user messages always
+# create new messages and never delete chat history.
 #
 # 2. <tg-emoji> RAW TAG FALLBACK (kept from v4)
 #    - If Telegram rejects an HTML send (e.g. an invalid custom emoji id), the
@@ -58,7 +52,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes,
@@ -502,33 +496,112 @@ class SMMBot:
 
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
-    # ==================== RENDER (plain send, nothing ever deleted) ====================
+    # ==================== RENDER ====================
+    # UX RULES:
+    #   * Commands / normal messages: always SEND a new message. Never delete.
+    #   * Inline-button clicks: update ONLY the message that owns the button.
+    #       - text -> text: edit in place
+    #       - photo -> photo: edit media in place
+    #       - text <-> photo: delete the old UI message and immediately replace it
+    #   * Button flows never create an extra progress/loading message.
     async def render(self, update, context, text=None, reply_markup=None, photo=None, caption=None, chat_id=None):
+        query = getattr(update, "callback_query", None)
+        callback_message = query.message if query else None
         chat_id = chat_id or update.effective_chat.id
-        try:
-            if photo is not None:
-                sent = await context.bot.send_photo(
-                    chat_id=chat_id, photo=photo, caption=caption,
-                    reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-            else:
-                sent = await context.bot.send_message(
-                    chat_id=chat_id, text=text,
-                    reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            # HTML (or a bad custom-emoji id) got rejected -> degrade to
-            # plain text instead of leaking raw <tg-emoji> tags to the user.
-            logger.error(f"Render send error, falling back to plain text: {e}")
-            plain_text = strip_html(text) if text else None
-            plain_caption = strip_html(caption) if caption else None
+
+        async def send_new(plain=False):
             if photo is not None:
                 try:
                     photo.seek(0)
                 except Exception:
                     pass
-                sent = await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=plain_caption, reply_markup=reply_markup)
-            else:
-                sent = await context.bot.send_message(chat_id=chat_id, text=plain_text, reply_markup=reply_markup)
-        return sent
+                kwargs = {
+                    "chat_id": chat_id,
+                    "photo": photo,
+                    "caption": strip_html(caption) if plain and caption else caption,
+                    "reply_markup": reply_markup,
+                }
+                if not plain:
+                    kwargs["parse_mode"] = ParseMode.HTML
+                return await context.bot.send_photo(**kwargs)
+
+            kwargs = {
+                "chat_id": chat_id,
+                "text": strip_html(text) if plain and text else text,
+                "reply_markup": reply_markup,
+            }
+            if not plain:
+                kwargs["parse_mode"] = ParseMode.HTML
+            return await context.bot.send_message(**kwargs)
+
+        # No callback query = command / normal text / photo input.
+        # Always create a NEW message. Nothing from history is deleted.
+        if callback_message is None:
+            try:
+                return await send_new(plain=False)
+            except Exception as e:
+                logger.warning("Render send failed, retrying plain: %s", e)
+                return await send_new(plain=True)
+
+        # Callback query = BUTTON FLOW. Only the clicked message is changed.
+        try:
+            if photo is not None:
+                # Existing photo message -> edit its media.
+                if callback_message.photo:
+                    try:
+                        photo.seek(0)
+                    except Exception:
+                        pass
+                    media = InputMediaPhoto(
+                        media=photo,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    await callback_message.edit_media(
+                        media=media, reply_markup=reply_markup
+                    )
+                    return callback_message
+
+                # Existing text message -> Telegram cannot change text into photo.
+                # Delete exactly that UI message, then replace it once.
+                await callback_message.delete()
+                return await send_new(plain=False)
+
+            # Existing photo -> text: replace the one UI message.
+            if callback_message.photo:
+                await callback_message.delete()
+                return await send_new(plain=False)
+
+            # Existing text -> text: true in-place edit.
+            try:
+                await callback_message.edit_text(
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                # If the content is already identical, Telegram reports
+                # MESSAGE_NOT_MODIFIED. That is not an error for the user.
+                if "not modified" in str(e).lower():
+                    try:
+                        await callback_message.edit_reply_markup(reply_markup=reply_markup)
+                    except Exception:
+                        pass
+                    return callback_message
+                raise
+            return callback_message
+
+        except Exception as e:
+            # Only as a last resort, replace the clicked UI message.
+            logger.warning("Button UI edit failed, replacing clicked message: %s", e)
+            try:
+                await callback_message.delete()
+            except Exception:
+                pass
+            try:
+                return await send_new(plain=False)
+            except Exception:
+                return await send_new(plain=True)
 
     async def post_to_channel(self, context, text):
         """Best-effort announcement post — never breaks the user-facing flow."""
@@ -539,6 +612,11 @@ class SMMBot:
 
     def menu_kb(self):
         return InlineKeyboardMarkup(grid([btn("Main Menu", "menu", emoji="🔑")], cols=1))
+
+    def is_button_update(self, update) -> bool:
+        """True only when the current screen was triggered by an inline button."""
+        return getattr(update, "callback_query", None) is not None
+
 
     # ==================== CATEGORIES ====================
     def categorize(self, service):
@@ -637,7 +715,8 @@ class SMMBot:
     async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if self.is_admin(update):
-            await self.render(update, context, text=f"{pe('⏱️')} Fetching panel balance...")
+            if not self.is_button_update(update):
+                await self.render(update, context, text=f"{pe('⏱️')} Fetching panel balance...")
             result = self.api.get_balance()
             if result and 'balance' in result:
                 text = f"""{pe('💰')} <b>Panel Balance (Admin)</b>
@@ -655,7 +734,8 @@ Balance: <code>₹{bal:.2f}</code>"""
         await self.render(update, context, text=text, reply_markup=self.menu_kb())
 
     async def services_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self.render(update, context, text=f"{pe('⏱️')} Loading services...")
+        if not self.is_button_update(update):
+            await self.render(update, context, text=f"{pe('⏱️')} Loading services...")
         services = await self.get_all_services(context)
         if not services:
             await self.render(update, context, text=f"{pe('ℹ️')} Failed to fetch services.", reply_markup=self.menu_kb())
@@ -858,9 +938,15 @@ Select a category:"""
 {pe('✅')} After successful payment, balance is credited automatically.
 {pe('ℹ️')} No screenshot or UTR is required."""
             pay_button = InlineKeyboardButton("Pay / Open Link", url=qr["short_url"])
-            await self.render(update, context, photo=img_bytes, caption=caption, reply_markup=InlineKeyboardMarkup([[pay_button], [btn("Main Menu", "menu", emoji="🔑")]]))
-            # Also show the actual short URL as text so the user can open it if scanning is inconvenient.
-            await self.render(update, context, text=f"{pe('🔗')} <b>Payment Link</b>\n\n{qr['short_url']}", reply_markup=self.menu_kb())
+            await self.render(
+                update, context,
+                photo=img_bytes,
+                caption=caption,
+                reply_markup=InlineKeyboardMarkup([
+                    [pay_button],
+                    [btn("Main Menu", "menu", emoji="🔑")],
+                ])
+            )
         except Exception as e:
             logger.exception("Could not generate/send Payment Link QR: %s", e)
             await self.render(update, context, text=f"{pe('💳')} <b>Razorpay Payment</b>\n\n{pe('💰')} Amount: ₹{amount}\n{pe('🆔')} TXN ID: <code>{txn_id}</code>\n\n{pe('🔗')} Payment Link: {qr['short_url']}", reply_markup=self.menu_kb())
@@ -1073,7 +1159,8 @@ Select a category:"""
             context.user_data.pop('order_confirm', None)
             return
 
-        await self.render(update, context, text=f"{pe('⏱️')} Placing order...")
+        if not self.is_button_update(update):
+            await self.render(update, context, text=f"{pe('⏱️')} Placing order...")
         result = self.api.add_order(pending['service_id'], pending['link'], pending['quantity'])
 
         if result and 'order' in result:
