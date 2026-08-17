@@ -703,7 +703,7 @@ class SMMBot:
                 context,
                 f"""{pe('🚀')} <b>New user joined the bot!</b>
 
-{pe('👤')} {name} (@{user.username or 'no_username'})""")
+{pe('👤')} {name} (@{user.username or 'Aerivue'})""")
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"""{pe('📖')} <b>EasySMMPanel Bot Commands</b>
@@ -1077,7 +1077,7 @@ Select a category:"""
         # Notify admin (separate chat — admin must have started the bot at least once)
         admin_text = f"""{pe('📤')} <b>New Payment Verification</b>
 
-{pe('👤')} User: {user.first_name} (@{user.username or 'no_username'})
+{pe('👤')} User: {user.first_name} (@{user.username or 'aerivue'})
 {pe('🆔')} User ID: <code>{user.id}</code>
 {pe('💰')} Amount: ₹{amount}
 {pe('🆔')} TXN: <code>{txn_id}</code>
@@ -1257,7 +1257,7 @@ Select a category:"""
                 context,
                 f"""{pe('📦')} <b>New Order!</b>
 
-{pe('👤')} {user.first_name} (@{user.username or 'no_username'}) just bought:
+{pe('👤')} {user.first_name} (@{user.username or 'aerivue'}) just bought:
 {pe('📌')} {pending['category']} — Service #{pending['service_id']}
 {pe('📊')} Quantity: {pending['quantity']}""")
         else:
@@ -1269,7 +1269,7 @@ Select a category:"""
             balance_issue = "balance" in str(error).lower()
             admin_alert = f"""{pe('ℹ️')} <b>Order Failed</b>{' — ⚠️ looks like the panel balance is low!' if balance_issue else ''}
 
-{pe('👤')} User: {user.first_name} (@{user.username or 'no_username'}) — <code>{user.id}</code>
+{pe('👤')} User: {user.first_name} (@{user.username or 'aerivue'}) — <code>{user.id}</code>
 {pe('🆔')} Service: {pending['service_id']} ({pending['category']})
 {pe('📊')} Quantity: {pending['quantity']}
 {pe('💰')} Amount (refunded to user): ₹{cost:.2f}
