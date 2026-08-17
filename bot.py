@@ -484,6 +484,12 @@ class SMMBot:
         self.app.add_handler(CommandHandler("refillstatus", self.refill_status_command))
         self.app.add_handler(CommandHandler("payment", self.payment_command))
 
+        # Service-list "Order Now" creates a NEW prompt and leaves
+        # the service-list message completely untouched.
+        self.app.add_handler(CallbackQueryHandler(
+            self.order_now_from_services_callback,
+            pattern="^ordnew$"))
+
         self.app.add_handler(CallbackQueryHandler(
             self.button_callback,
             pattern="^(bal|serv|ord|pay|stat|canc|refstat|ref|menu)$"))
@@ -815,7 +821,7 @@ Select a category:"""
             nav_row.append(InlineKeyboardButton("Next ›", callback_data=f"pg_{cat_index}_{page+1}"))
 
         keyboard = [nav_row] if nav_row else []
-        keyboard += grid([btn("Order Now", "ord", emoji="📦", style="success"),
+        keyboard += grid([btn("Order Now", "ordnew", emoji="📦", style="success"),
                            btn("Categories", "serv", emoji="📊")], cols=2)
         keyboard.append([btn("Main Menu", "menu", emoji="🔑")])
 
@@ -1394,6 +1400,25 @@ Select a category:"""
         await self.render(update, context, text=f"{pe('ℹ️')} Use /start to see the main menu", reply_markup=self.menu_kb())
 
     # ==================== BUTTON CALLBACKS ====================
+
+    async def order_now_from_services_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Service-list Order Now:
+        - NEVER edits the service-list message.
+        - NEVER deletes the service-list message.
+        - ALWAYS sends a NEW order prompt below it.
+        """
+        query = update.callback_query
+        await query.answer()
+
+        context.user_data["order_step"] = "service_id"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"{pe('📦')} <b>New Order</b>\n\n"
+                 f"Enter Service ID (use /services to find):",
+            parse_mode=ParseMode.HTML,
+        )
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
