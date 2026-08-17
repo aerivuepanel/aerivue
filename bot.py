@@ -13,6 +13,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 import requests
+import qrcode
+from dotenv import load_dotenv
+
+load_dotenv()
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
-load_dotenv()
+load_dotevn()
 
 # ==================== PREMIUM EMOJIS ====================
 # NOTE: these ids must be custom emoji ids your bot actually has access to.
@@ -92,9 +96,9 @@ def grid(buttons, cols=2):
 
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8-vg")
-API_URL = "https://easysmmpanel.com/api/v2"
-API_KEY = os.environ.get("SMM_API_KEY", "sdfsf")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_URL = os.environ.get("SMM_API_URL", "https://easysmmpanel.com/api/v2")
+API_KEY = os.environ.get("SMM_API_KEY", "")
 
 # Razorpay credentials. Set these as environment variables; never hard-code secrets.
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
@@ -102,7 +106,7 @@ RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 
 # <-- REPLACE WITH YOUR OWN TELEGRAM NUMERIC USER ID (get it from @userinfobot)
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "demon_smm_bot")
@@ -136,14 +140,19 @@ def verify_razorpay_webhook(raw_body: bytes, signature: str) -> bool:
 
 
 def process_razorpay_webhook(payload: dict):
+    """Schedule webhook processing without blocking Razorpay's HTTP request."""
     if not BOT_INSTANCE or not BOT_LOOP:
         logger.error("Razorpay webhook received before bot loop was ready")
         return
-    future = asyncio.run_coroutine_threadsafe(BOT_INSTANCE.handle_razorpay_webhook(payload), BOT_LOOP)
-    try:
-        future.result(timeout=25)
-    except Exception as e:
-        logger.error(f"Razorpay webhook processing failed: {e}")
+    future = asyncio.run_coroutine_threadsafe(
+        BOT_INSTANCE.handle_razorpay_webhook(payload), BOT_LOOP
+    )
+    def _done(fut):
+        try:
+            fut.result()
+        except Exception as exc:
+            logger.exception("Razorpay webhook processing failed: %s", exc)
+    future.add_done_callback(_done)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -173,7 +182,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             payload = json.loads(raw_body.decode("utf-8"))
-            if payload.get("event") == "qr_code.credited":
+            if payload.get("event") == "payment_link.paid":
                 process_razorpay_webhook(payload)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -291,8 +300,9 @@ class Store:
 
     async def ensure_indexes(self):
         await self.users.create_index("_id")
-        await self.pending.create_index("qr_code_id", unique=True, sparse=True)
+        await self.pending.create_index("payment_link_id", unique=True, sparse=True)
         await self.pending.create_index("razorpay_payment_id", unique=True, sparse=True)
+        await self.users.create_index("razorpay_payment_ids")
 
     # ---- wallets ----
     async def ensure_user(self, uid: int, name: str = None, username: str = None) -> bool:
@@ -345,13 +355,69 @@ class Store:
         doc["created_at"] = datetime.now(timezone.utc)
         await self.pending.replace_one({"_id": txn_id}, doc, upsert=True)
 
-    async def credit_razorpay_payment(self, qr_code_id: str, payment_id: str, amount_paise: int):
-        info = await self.pending.find_one({"qr_code_id": qr_code_id, "status": "pending"})
+    async def credit_razorpay_payment(self, payment_link_id: str, payment_id: str, amount_paise: int):
+        """Validate a pending QR payment and credit the wallet idempotently.
+
+        The user's wallet update is atomic and also stores the Razorpay payment id,
+        so the same payment can never be credited twice even if Razorpay retries
+        the webhook.
+        """
+        info = await self.pending.find_one({
+            "payment_link_id": payment_link_id,
+            "status": "pending",
+        })
         if not info:
-            return None, "not_found_or_already_processed"
+            # A duplicate webhook may arrive after the pending record was marked
+            # credited. Treat it as already handled rather than crediting again.
+            existing = await self.pending.find_one({"razorpay_payment_id": payment_id})
+            if existing:
+                return existing, "already_processed"
+            return None, "not_found"
+
         expected_paise = int(round(float(info.get("amount", 0)) * 100))
         if amount_paise != expected_paise:
+            await self.pending.update_one(
+                {"_id": info["_id"], "status": "pending"},
+                {"$set": {
+                    "status": "amount_mismatch",
+                    "razorpay_payment_id": payment_id,
+                    "received_amount_paise": amount_paise,
+                    "updated_at": datetime.now(timezone.utc),
+                }}
+            )
             return None, f"amount_mismatch:{amount_paise}!={expected_paise}"
+
+        uid = int(info["user_id"])
+        amount = float(info["amount"])
+
+        # One MongoDB document update = atomic. The same payment_id cannot
+        # increment the balance twice.
+        wallet = await self.users.find_one_and_update(
+            {"_id": uid, "razorpay_payment_ids": {"$ne": payment_id}},
+            {
+                "$inc": {"balance": amount},
+                "$addToSet": {"razorpay_payment_ids": payment_id},
+                "$set": {"name": info.get("name", ""), "username": info.get("username", "")},
+            },
+            upsert=False,
+            return_document=ReturnDocument.AFTER,
+        )
+
+        # No match means this exact Razorpay payment id was already recorded.
+        if wallet is None:
+            existing_user = await self.users.find_one({"_id": uid})
+            if existing_user and payment_id in existing_user.get("razorpay_payment_ids", []):
+                await self.pending.update_one(
+                    {"_id": info["_id"], "status": "pending"},
+                    {"$set": {
+                        "status": "credited",
+                        "razorpay_payment_id": payment_id,
+                        "credited_at": datetime.now(timezone.utc),
+                    }}
+                )
+            return None, "already_processed"
+
+        new_balance = float(wallet.get("balance", 0))
         claimed = await self.pending.find_one_and_update(
             {"_id": info["_id"], "status": "pending"},
             {"$set": {
@@ -362,8 +428,9 @@ class Store:
             return_document=ReturnDocument.AFTER,
         )
         if not claimed:
-            return None, "already_processed"
-        new_balance = await self.add_balance(int(info["user_id"]), float(info["amount"]), name=info.get("name"))
+            # Wallet already contains this payment id, so this is still safe.
+            claimed = await self.pending.find_one({"_id": info["_id"]}) or info
+
         return {**claimed, "new_balance": new_balance}, "credited"
 
 # ==================== MAIN BOT ====================
@@ -393,12 +460,9 @@ class SMMBot:
         self.app.add_handler(CallbackQueryHandler(self.category_callback, pattern="^cat_"))
         self.app.add_handler(CallbackQueryHandler(self.page_callback, pattern="^pg_"))
         self.app.add_handler(CallbackQueryHandler(self.payment_callback, pattern="^payamt_"))
-        self.app.add_handler(CallbackQueryHandler(self.paid_callback, pattern="^paid_"))
-        self.app.add_handler(CallbackQueryHandler(self.admin_decision_callback, pattern="^(apprv|rejct)_"))
         self.app.add_handler(CallbackQueryHandler(self.order_confirm_callback, pattern="^ordconfirm$"))
         self.app.add_handler(CallbackQueryHandler(self.order_cancel_callback, pattern="^ordcancel$"))
 
-        self.app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
     # ==================== RENDER (plain send, nothing ever deleted) ====================
@@ -640,7 +704,7 @@ Select a category:"""
 
         await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # ==================== PAYMENT (with manual verification) ====================
+    # ==================== PAYMENT (Razorpay Payment Link + QR) ====================
 
     async def payment_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = grid([
@@ -672,33 +736,54 @@ Select a category:"""
     def razorpay_ready(self):
         return bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET and RAZORPAY_WEBHOOK_SECRET)
 
-    def create_razorpay_qr(self, amount: int, txn_id: str, user_id: int):
+    def create_razorpay_payment_link(self, amount: int, txn_id: str, user_id: int):
+        """Create a Razorpay UPI Payment Link. A local QR is generated from its short_url.
+
+        This avoids the separate Razorpay Payment Link QRs API feature, which may be disabled
+        on an account. Payment Links are available as a standard product and expose
+        the payment_link.paid webhook event.
+        """
         if not self.razorpay_ready():
             return {"error": "Razorpay is not configured. Set RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET and RAZORPAY_WEBHOOK_SECRET."}
         payload = {
-            "type": "upi_qr",
-            "name": f"Telegram_{user_id}_{txn_id}",
-            "usage": "single_use",
-            "fixed_amount": True,
-            "payment_amount": int(amount * 100),
+            "upi_link": True,
+            "amount": int(amount * 100),
+            "currency": "INR",
+            "accept_partial": False,
+            "reference_id": txn_id[:40],
             "description": f"Wallet top-up {txn_id}",
-            "close_by": int(time.time()) + 30 * 60,
-            "notes": {"telegram_user_id": str(user_id), "txn_id": txn_id},
+            "notes": {
+                "telegram_user_id": str(user_id),
+                "txn_id": txn_id,
+            },
+            "expire_by": int(time.time()) + 30 * 60,
+            "reminder_enable": False,
+            "notify": {"sms": False, "email": False},
         }
         try:
             response = requests.post(
-                "https://api.razorpay.com/v1/payments/qr_codes",
+                "https://api.razorpay.com/v1/payment_links",
                 auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
                 json=payload, timeout=30
             )
             data = response.json()
             if response.status_code >= 400:
-                logger.error(f"Razorpay QR create failed: {data}")
+                logger.error("Razorpay Payment Link create failed: %s", data)
                 return {"error": data.get("error", {}).get("description", str(data))}
             return data
         except Exception as e:
-            logger.error(f"Razorpay QR API error: {e}")
+            logger.exception("Razorpay Payment Link API error: %s", e)
             return {"error": str(e)}
+
+    def make_qr_image(self, text: str):
+        qr = qrcode.QRCode(version=None, box_size=10, border=4)
+        qr.add_data(text)
+        qr.make(fit=True)
+        image = qr.make_image()
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
 
     async def generate_upi_payment(self, update, amount, context):
         user = update.effective_user
@@ -712,74 +797,102 @@ Select a category:"""
             return
 
         txn_id = f"TXN{datetime.now().strftime('%Y%m%d%H%M%S')}{random.randint(1000, 9999)}"
-        qr = self.create_razorpay_qr(amount, txn_id, user.id)
-        if not qr or "id" not in qr or not qr.get("image_url"):
+        qr = self.create_razorpay_payment_link(amount, txn_id, user.id)
+        if not qr or "id" not in qr or not qr.get("short_url"):
             error = qr.get("error", "Unknown error") if isinstance(qr, dict) else "Unknown error"
             await self.render(update, context, text=f"{pe('ℹ️')} Could not create Razorpay QR.\n\n<code>{error}</code>", reply_markup=self.menu_kb())
             return
 
         await self.store.add_razorpay_pending(txn_id, {
             "user_id": user.id, "name": user.first_name, "username": user.username or "",
-            "amount": float(amount), "qr_code_id": qr["id"], "razorpay_image_url": qr["image_url"],
+            "amount": float(amount), "payment_link_id": qr["id"], "razorpay_payment_link_url": qr["short_url"],
         })
-        context.user_data['pending_payment'] = {'amount': amount, 'txn_id': txn_id, 'qr_code_id': qr['id']}
+        context.user_data['pending_payment'] = {'amount': amount, 'txn_id': txn_id, 'payment_link_id': qr['id']}
 
         try:
-            image_response = requests.get(qr["image_url"], timeout=30)
-            image_response.raise_for_status()
-            img_bytes = io.BytesIO(image_response.content)
-            img_bytes.seek(0)
-            caption = f"""{pe('💳')} <b>Razorpay UPI Payment</b>
+            img_bytes = self.make_qr_image(qr["short_url"])
+            caption = f"""{pe('💳')} <b>Razorpay Payment</b>
 
 {pe('💰')} Amount: ₹{amount}
 {pe('🆔')} TXN ID: <code>{txn_id}</code>
 
-{pe('📱')} Scan with GPay / PhonePe / Paytm.
-{pe('⚡️')} After successful payment, balance is credited automatically.
+{pe('📱')} Scan this QR with GPay / PhonePe / Paytm.
+{pe('⚡️')} QR opens Razorpay's secure UPI payment page.
+{pe('✅')} After successful payment, balance is credited automatically.
 {pe('ℹ️')} No screenshot or UTR is required."""
-            await self.render(update, context, photo=img_bytes, caption=caption, reply_markup=InlineKeyboardMarkup([[btn("Main Menu", "menu", emoji="🔑")]]))
+            pay_button = InlineKeyboardButton("Pay / Open Link", url=qr["short_url"])
+            await self.render(update, context, photo=img_bytes, caption=caption, reply_markup=InlineKeyboardMarkup([[pay_button], [btn("Main Menu", "menu", emoji="🔑")]]))
+            # Also show the actual short URL as text so the user can open it if scanning is inconvenient.
+            await self.render(update, context, text=f"{pe('🔗')} <b>Payment Link</b>\n\n{qr['short_url']}", reply_markup=self.menu_kb())
         except Exception as e:
-            logger.error(f"Could not download Razorpay QR image: {e}")
-            await self.render(update, context, text=f"{pe('💳')} <b>Razorpay Payment</b>\n\n{pe('💰')} Amount: ₹{amount}\n{pe('🆔')} TXN ID: <code>{txn_id}</code>\n\n{pe('📱')} Open QR: {qr['image_url']}", reply_markup=self.menu_kb())
+            logger.exception("Could not generate/send Payment Link QR: %s", e)
+            await self.render(update, context, text=f"{pe('💳')} <b>Razorpay Payment</b>\n\n{pe('💰')} Amount: ₹{amount}\n{pe('🆔')} TXN ID: <code>{txn_id}</code>\n\n{pe('🔗')} Payment Link: {qr['short_url']}", reply_markup=self.menu_kb())
 
     async def handle_razorpay_webhook(self, payload: dict):
-        if payload.get("event") != "qr_code.credited":
-            return
-        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
-        qr = payload.get("payload", {}).get("qr_code", {}).get("entity", {})
-        qr_id, payment_id = qr.get("id"), payment.get("id")
-        amount_paise = int(payment.get("amount", 0) or 0)
-        if not qr_id or not payment_id or payment.get("status") != "captured":
-            logger.warning("Ignoring incomplete Razorpay QR webhook")
+        if payload.get("event") != "payment_link.paid":
             return
 
-        info, status = await self.store.credit_razorpay_payment(qr_id, payment_id, amount_paise)
-        if status != "credited":
-            logger.warning(f"Razorpay payment {payment_id} not credited: {status}")
+        pl = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+        payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        payment_id = payment.get("id") or payload.get("id") or f"plink:{payment_link_id}"
+        payment_link_id = pl.get("id") or ""
+        amount_paise = int(payment.get("amount", 0) or pl.get("amount_paid", 0) or 0)
+        status = payment.get("status") or "captured"
+        currency = payment.get("currency") or pl.get("currency") or "INR"
+
+        if not payment_link_id:
+            logger.warning("payment_link.paid received without payment_link id")
+            return
+        if currency not in ("INR", ""):
+            logger.warning("Ignoring non-INR payment link: %s", payment_link_id)
+            return
+        if payment.get("id") and status not in ("captured", ""):
+            logger.warning("Ignoring payment link with payment status %s: %s", status, payment_link_id)
+            return
+
+        info, credit_status = await self.store.credit_razorpay_payment(
+            payment_link_id, payment_id, amount_paise
+        )
+        if credit_status == "already_processed":
+            logger.info("Ignoring duplicate Razorpay payment webhook: %s", payment_id)
+            return
+        if credit_status != "credited":
+            logger.warning("Razorpay payment %s not credited: %s", payment_id, credit_status)
             return
 
         uid, amount = int(info["user_id"]), float(info["amount"])
         new_balance, txn_id = float(info["new_balance"]), info.get("_id", "")
+
         try:
-            await self.app.bot.send_message(chat_id=uid, text=(
-                f"{pe('✅')} <b>Payment Successful!</b>\n\n"
-                f"{pe('💰')} ₹{amount:.2f} added to your balance.\n"
-                f"{pe('🆔')} Payment ID: <code>{payment_id}</code>\n"
-                f"{pe('📌')} TXN: <code>{txn_id}</code>\n"
-                f"{pe('💰')} New Balance: ₹{new_balance:.2f}"
-            ), parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.error(f"Could not notify user after Razorpay payment: {e}")
+            await self.app.bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"{pe('✅')} <b>Payment Successful!</b>\n\n"
+                    f"{pe('💰')} ₹{amount:.2f} added to your balance.\n"
+                    f"{pe('🆔')} Payment ID: <code>{payment_id}</code>\n"
+                    f"{pe('📌')} TXN: <code>{txn_id}</code>\n"
+                    f"{pe('💰')} New Balance: ₹{new_balance:.2f}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.error("Could not notify user after Razorpay payment %s: %s", payment_id, exc)
+
         try:
-            await self.app.bot.send_message(chat_id=ADMIN_ID, text=(
-                f"{pe('✅')} <b>Razorpay Payment Credited</b>\n\n"
-                f"{pe('👤')} User ID: <code>{uid}</code>\n"
-                f"{pe('💰')} Amount: ₹{amount:.2f}\n"
-                f"{pe('🆔')} Payment: <code>{payment_id}</code>\n"
-                f"{pe('📌')} TXN: <code>{txn_id}</code>"
-            ), parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.error(f"Could not notify admin after Razorpay payment: {e}")
+            await self.app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"{pe('✅')} <b>Razorpay Payment Credited</b>\n\n"
+                    f"{pe('👤')} User ID: <code>{uid}</code>\n"
+                    f"{pe('💰')} Amount: ₹{amount:.2f}\n"
+                    f"{pe('🆔')} Payment: <code>{payment_id}</code>\n"
+                    f"{pe('📌')} TXN: <code>{txn_id}</code>\n"
+                    f"{pe('🔗')} Payment Link: <code>{payment_link_id}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.error("Could not notify admin after Razorpay payment %s: %s", payment_id, exc)
 
     async def paid_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """User claims they've paid -> ask for screenshot, then UTR, before it ever reaches admin."""
@@ -1193,6 +1306,21 @@ Select a category:"""
         await self.store.ensure_indexes()
 
     def run(self):
+        required = {
+            "BOT_TOKEN": BOT_TOKEN,
+            "SMM_API_KEY": API_KEY,
+            "ADMIN_ID": str(ADMIN_ID) if ADMIN_ID else "",
+            "MONGO_URI": MONGO_URI,
+            "RAZORPAY_KEY_ID": RAZORPAY_KEY_ID,
+            "RAZORPAY_KEY_SECRET": RAZORPAY_KEY_SECRET,
+            "RAZORPAY_WEBHOOK_SECRET": RAZORPAY_WEBHOOK_SECRET,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+        if len(RAZORPAY_WEBHOOK_SECRET) < 32:
+            raise RuntimeError("RAZORPAY_WEBHOOK_SECRET is too short; use a strong random secret of at least 32 characters.")
+
         self.app.post_init = self._post_init
         start_health_server(PORT)
         print(f"""
