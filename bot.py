@@ -485,10 +485,6 @@ class SMMBot:
         self.app.add_handler(CommandHandler("payment", self.payment_command))
 
         self.app.add_handler(CallbackQueryHandler(
-            self.order_now_from_services_callback,
-            pattern="^ordnew$"))
-
-        self.app.add_handler(CallbackQueryHandler(
             self.button_callback,
             pattern="^(bal|serv|ord|pay|stat|canc|refstat|ref|menu)$"))
         self.app.add_handler(CallbackQueryHandler(self.categories_page_callback, pattern="^catpg_"))
@@ -819,7 +815,7 @@ Select a category:"""
             nav_row.append(InlineKeyboardButton("Next ›", callback_data=f"pg_{cat_index}_{page+1}"))
 
         keyboard = [nav_row] if nav_row else []
-        keyboard += grid([btn("Order Now", "ordnew", emoji="📦", style="success"),
+        keyboard += grid([btn("Order Now", "ord", emoji="📦", style="success"),
                            btn("Categories", "serv", emoji="📊")], cols=2)
         keyboard.append([btn("Main Menu", "menu", emoji="🔑")])
 
@@ -1250,35 +1246,24 @@ Select a category:"""
         if context.user_data.get('order_step') == 'service_id':
             service = await self.find_service(context, user_input)
             if not service:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=f"{pe('ℹ️')} Service ID not found.\n\n"
-                         f"{pe('🆔')} Enter a valid Service ID (use /services to browse):",
-                    parse_mode=ParseMode.HTML,
-                )
+                await self.render(update, context, text=f"{pe('ℹ️')} Service ID not found. Enter a valid Service ID (use /services to browse):")
                 return
             context.user_data['order_service'] = service
             context.user_data['order_step'] = 'link'
             admin = self.is_admin(update)
             rate_line = (f"Rate/1000: {service.get('rate','N/A')}" if admin
                          else f"Rate/1000: ₹{display_rate_per_1000(float(service.get('rate', 0) or 0), TIER1_MAX_QTY):.2f}")
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
+            await self.render(
+                update, context,
                 text=f"{pe('📦')} <b>{service.get('name','Unknown')[:60]}</b>\n"
                      f"{pe('💰')} {rate_line} | Min: {service.get('min','N/A')} | Max: {service.get('max','N/A')}\n\n"
-                     f"Enter the Link/URL:",
-                parse_mode=ParseMode.HTML,
-            )
+                     f"Enter the Link/URL:")
             return
 
         if context.user_data.get('order_step') == 'link':
             context.user_data['order_link'] = user_input
             context.user_data['order_step'] = 'quantity'
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"{pe('📦')} Enter the Quantity:",
-                parse_mode=ParseMode.HTML,
-            )
+            await self.render(update, context, text=f"{pe('📦')} Enter the Quantity:")
             return
 
         if context.user_data.get('order_step') == 'quantity':
@@ -1409,17 +1394,6 @@ Select a category:"""
         await self.render(update, context, text=f"{pe('ℹ️')} Use /start to see the main menu", reply_markup=self.menu_kb())
 
     # ==================== BUTTON CALLBACKS ====================
-
-    async def order_now_from_services_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Service-list Order Now = exactly the same workflow as /order.
-        The service-list message is left untouched.
-        """
-        query = update.callback_query
-        await query.answer("Enter the Service ID below 👇")
-
-        # Reuse the existing /order handler instead of duplicating the flow.
-        await self.order_command(update, context)
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
