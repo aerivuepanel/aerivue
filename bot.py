@@ -484,9 +484,17 @@ class SMMBot:
         self.app.add_handler(CommandHandler("refillstatus", self.refill_status_command))
         self.app.add_handler(CommandHandler("payment", self.payment_command))
 
+        # Normal inline-button callbacks.
+        # "ord" is intentionally excluded because Order Now must start
+        # a NEW order-flow message without editing/deleting the Services UI.
         self.app.add_handler(CallbackQueryHandler(
             self.button_callback,
-            pattern="^(bal|serv|ord|pay|stat|canc|refstat|ref|menu)$"))
+            pattern="^(bal|serv|pay|stat|canc|refstat|ref|menu)$"))
+
+        # Order Now gets a dedicated callback.
+        self.app.add_handler(CallbackQueryHandler(
+            self.order_now_callback,
+            pattern="^ord$"))
         self.app.add_handler(CallbackQueryHandler(self.categories_page_callback, pattern="^catpg_"))
         self.app.add_handler(CallbackQueryHandler(self.category_callback, pattern="^cat_"))
         self.app.add_handler(CallbackQueryHandler(self.page_callback, pattern="^pg_"))
@@ -1139,6 +1147,43 @@ Select a category:"""
 
     # ==================== ORDER (wallet-gated, markup-aware) ====================
 
+    async def order_now_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Start the existing order flow from the Services "Order Now" button.
+
+        Unlike normal inline-button flows, this intentionally does NOT call
+        self.render() because render() edits/deletes the message that owns
+        the callback. The Services message must remain untouched.
+
+        We reuse the same order state used by /order, but send the first
+        order prompt as a NEW Telegram message. The literal /order command
+        is never sent into the chat.
+        """
+        query = update.callback_query
+        await query.answer()
+
+        # Start clean if the user previously abandoned an order.
+        for key in (
+            'order_step',
+            'order_service',
+            'order_link',
+            'order_confirm',
+        ):
+            context.user_data.pop(key, None)
+
+        # Exactly the same first state as the manual /order command.
+        context.user_data['order_step'] = 'service_id'
+
+        # IMPORTANT: send a NEW message. Do not use self.render() here.
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"{pe('📦')} <b>New Order</b>\n\n"
+                f"Enter Service ID (use /services to find):"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
     async def order_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['order_step'] = 'service_id'
         await self.render(update, context, text=f"{pe('📦')} <b>New Order</b>\n\nEnter Service ID (use /services to find):")
@@ -1400,9 +1445,14 @@ Select a category:"""
         await query.answer()
         data = query.data
         handlers = {
-            "menu": self.start_command, "bal": self.balance_command, "serv": self.services_command,
-            "ord": self.order_command, "pay": self.payment_command, "stat": self.status_command,
-            "canc": self.cancel_command, "ref": self.refill_command, "refstat": self.refill_status_command,
+            "menu": self.start_command,
+            "bal": self.balance_command,
+            "serv": self.services_command,
+            "pay": self.payment_command,
+            "stat": self.status_command,
+            "canc": self.cancel_command,
+            "ref": self.refill_command,
+            "refstat": self.refill_status_command,
         }
         await handlers[data](update, context)
 
