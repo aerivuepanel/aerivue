@@ -25,8 +25,7 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes,
 )
 from telegram.constants import ParseMode
-from dotenv import load_dotenv
-load_dotevn()
+
 
 # ==================== PREMIUM EMOJIS ====================
 # NOTE: these ids must be custom emoji ids your bot actually has access to.
