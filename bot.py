@@ -1413,15 +1413,16 @@ Select a category:"""
     async def order_now_from_services_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Order Now from service list: keep list untouched and send a NEW prompt."""
         query = update.callback_query
-        await query.answer()
         context.user_data["order_step"] = "service_id"
 
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"{pe('📦')} <b>New Order</b>\n\n"
-                 f"{pe('🆔')} Enter Service ID (use /services to find):",
+        # Reply directly to the clicked service-list message. This is a NEW
+        # Telegram message; the service-list message is never edited/deleted.
+        await query.message.reply_text(
+            f"{pe('📦')} <b>New Order</b>\n\n"
+            f"{pe('🆔')} Enter Service ID (use /services to find):",
             parse_mode=ParseMode.HTML,
         )
+        await query.answer("Enter the Service ID below 👇")
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
