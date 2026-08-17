@@ -484,8 +484,6 @@ class SMMBot:
         self.app.add_handler(CommandHandler("refillstatus", self.refill_status_command))
         self.app.add_handler(CommandHandler("payment", self.payment_command))
 
-        # Service-list "Order Now" creates a NEW prompt and leaves
-        # the service-list message completely untouched.
         self.app.add_handler(CallbackQueryHandler(
             self.order_now_from_services_callback,
             pattern="^ordnew$"))
@@ -1252,24 +1250,35 @@ Select a category:"""
         if context.user_data.get('order_step') == 'service_id':
             service = await self.find_service(context, user_input)
             if not service:
-                await self.render(update, context, text=f"{pe('ℹ️')} Service ID not found. Enter a valid Service ID (use /services to browse):")
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"{pe('ℹ️')} Service ID not found.\n\n"
+                         f"{pe('🆔')} Enter a valid Service ID (use /services to browse):",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             context.user_data['order_service'] = service
             context.user_data['order_step'] = 'link'
             admin = self.is_admin(update)
             rate_line = (f"Rate/1000: {service.get('rate','N/A')}" if admin
                          else f"Rate/1000: ₹{display_rate_per_1000(float(service.get('rate', 0) or 0), TIER1_MAX_QTY):.2f}")
-            await self.render(
-                update, context,
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
                 text=f"{pe('📦')} <b>{service.get('name','Unknown')[:60]}</b>\n"
                      f"{pe('💰')} {rate_line} | Min: {service.get('min','N/A')} | Max: {service.get('max','N/A')}\n\n"
-                     f"Enter the Link/URL:")
+                     f"Enter the Link/URL:",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if context.user_data.get('order_step') == 'link':
             context.user_data['order_link'] = user_input
             context.user_data['order_step'] = 'quantity'
-            await self.render(update, context, text=f"{pe('📦')} Enter the Quantity:")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"{pe('📦')} Enter the Quantity:",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if context.user_data.get('order_step') == 'quantity':
@@ -1402,21 +1411,15 @@ Select a category:"""
     # ==================== BUTTON CALLBACKS ====================
 
     async def order_now_from_services_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Service-list Order Now:
-        - NEVER edits the service-list message.
-        - NEVER deletes the service-list message.
-        - ALWAYS sends a NEW order prompt below it.
-        """
+        """Order Now from service list: keep list untouched and send a NEW prompt."""
         query = update.callback_query
         await query.answer()
-
         context.user_data["order_step"] = "service_id"
 
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"{pe('📦')} <b>New Order</b>\n\n"
-                 f"Enter Service ID (use /services to find):",
+                 f"{pe('🆔')} Enter Service ID (use /services to find):",
             parse_mode=ParseMode.HTML,
         )
 
