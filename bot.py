@@ -1411,18 +1411,15 @@ Select a category:"""
     # ==================== BUTTON CALLBACKS ====================
 
     async def order_now_from_services_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Order Now from service list: keep list untouched and send a NEW prompt."""
+        """
+        Service-list Order Now = exactly the same workflow as /order.
+        The service-list message is left untouched.
+        """
         query = update.callback_query
-        context.user_data["order_step"] = "service_id"
-
-        # Reply directly to the clicked service-list message. This is a NEW
-        # Telegram message; the service-list message is never edited/deleted.
-        await query.message.reply_text(
-            f"{pe('📦')} <b>New Order</b>\n\n"
-            f"{pe('🆔')} Enter Service ID (use /services to find):",
-            parse_mode=ParseMode.HTML,
-        )
         await query.answer("Enter the Service ID below 👇")
+
+        # Reuse the existing /order handler instead of duplicating the flow.
+        await self.order_command(update, context)
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
