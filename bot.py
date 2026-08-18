@@ -773,7 +773,7 @@ class SMMBot:
             btn("Main Menu", "menu", emoji="🔑")
         ])
 
-        text = f"""{pe('📌')} <b>{pe({emoji})} {label}</b>
+        text = f"""{pe('📌')} <b>{pe(emoji)} {label}</b>
 
 {pe('📦')} {len(sorted_cats)} categories · {len(platform_services)} services
 
