@@ -956,7 +956,7 @@ class SMMBot:
                 context,
                 f"""{pe('🚀')} <b>New user joined the bot!</b>
 
-{pe('👤')} {name} (@{user.username or 'Aerivue'})""")
+{pe('👤')} {name} (@{user.username or ''})""")
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
        text = f"""{pe('📖')} <b>ROSESMM Bot — Help & Guide</b>
@@ -1350,7 +1350,7 @@ Select a category:"""
                 text=(
                     f"{pe('💰')} <b>New Payment Received!</b>\n\n"
                     f"{pe('👤')} User ID: <code>{uid}</code>\n"
-                    f"{pe('👤')} Name: {info.get('name', '')} (@{info.get('username') or 'aerivue'})\n"
+                    f"{pe('👤')} Name: {info.get('name', '')} (@{info.get('username') or ''})\n"
                     f"{pe('💰')} Amount: ₹{amount:.2f}\n"
                     f"{pe('🆔')} Payment: <code>{payment_id}</code>\n"
                     f"{pe('📌')} TXN: <code>{txn_id}</code>"
@@ -1412,7 +1412,7 @@ Select a category:"""
         # Notify admin (separate chat — admin must have started the bot at least once)
         admin_text = f"""{pe('📤')} <b>New Payment Verification</b>
 
-{pe('👤')} User: {user.first_name} (@{user.username or 'aerivue'})
+{pe('👤')} User: {user.first_name} (@{user.username or ''})
 {pe('🆔')} User ID: <code>{user.id}</code>
 {pe('💰')} Amount: ₹{amount}
 {pe('🆔')} TXN: <code>{txn_id}</code>
@@ -1473,7 +1473,7 @@ Select a category:"""
                     text=(
                         f"{pe('💰')} <b>New Payment Approved!</b>\n\n"
                         f"{pe('👤')} User ID: <code>{target_uid}</code>\n"
-                        f"{pe('👤')} Name: {info.get('name', '')} (@{info.get('username') or 'aerivue'})\n"
+                        f"{pe('👤')} Name: {info.get('name', '')} (@{info.get('username') or ''})\n"
                         f"{pe('💰')} Amount: ₹{amount}\n"
                         f"{pe('📌')} TXN: <code>{txn_id}</code>"
                     ),
@@ -1610,7 +1610,7 @@ Select a category:"""
                 context,
                 f"""{pe('📦')} <b>New Order!</b>
 
-{pe('👤')} <b>User:</b> {user.first_name} (@{user.username or 'aerivue'})
+{pe('👤')} <b>User:</b> {user.first_name} (@{user.username or ''})
 {pe('🆔')} <b>Order ID:</b> <code>{result['order']}</code>
 {pe('📌')} <b>Service:</b> {pending['category']} — #{pending['service_id']}
 {pe('🔗')} <b>Link:</b> <code>{pending['link']}</code>
@@ -1625,7 +1625,7 @@ Select a category:"""
             balance_issue = "balance" in str(error).lower()
             admin_alert = f"""{pe('ℹ️')} <b>Order Failed</b>{' — ⚠️ looks like the panel balance is low!' if balance_issue else ''}
 
-{pe('👤')} User: {user.first_name} (@{user.username or 'aerivue'}) — <code>{user.id}</code>
+{pe('👤')} User: {user.first_name} (@{user.username or ''}) — <code>{user.id}</code>
 {pe('🆔')} Service: {pending['service_id']} ({pending['category']})
 {pe('📊')} Quantity: {pending['quantity']}
 {pe('💰')} Amount (refunded to user): ₹{cost:.2f}
