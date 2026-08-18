@@ -1670,8 +1670,8 @@ Select a category:"""
         if context.user_data.get('payment_step') == 'custom':
             try:
                 amount = int(user_input)
-                if amount < 10:
-                    await self.render(update, context, text=f"{pe('ℹ️')} Minimum amount is ₹10.")
+                if amount < 1:
+                    await self.render(update, context, text=f"{pe('ℹ️')} Minimum amount is ₹1.")
                     return
                 await self.generate_upi_payment(update, amount, context)
                 context.user_data.pop('payment_step', None)
