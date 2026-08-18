@@ -959,19 +959,83 @@ class SMMBot:
 {pe('👤')} {name} (@{user.username or 'Aerivue'})""")
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = f"""{pe('📖')} <b>ROSESMM Bot Commands</b>
+       text = f"""{pe('📖')} <b>ROSESMM Bot — Help & Guide</b>
 
-{pe('⭐')} /start - Show main menu
-{pe('ℹ️')} /help - Show this help
-{pe('💰')} /balance - Check your balance
-{pe('📊')} /services - Browse services by category
-{pe('📦')} /order - Place a new order
-{pe('💳')} /payment - Add balance via UPI
-{pe('📈')} /status - Check order status
-{pe('🛡️')} /cancel - Cancel an order
-{pe('📤')} /refill - Create a refill
-{pe('📝')} /refillstatus - Check refill status"""
-        await self.render(update, context, text=text)
+{pe('👋')} <b>Getting Started</b>
+
+{pe('⭐')} <b>/start</b>
+Open the main menu and access all bot features.
+
+{pe('💰')} <b>/balance</b>
+Check your current wallet balance.
+
+{pe('💳')} <b>/payment</b>
+Add funds to your wallet using UPI.
+
+━━━━━━━━━━━━━━━━━━
+
+{pe('🛍️')} <b>Services & Orders</b>
+
+{pe('📊')} <b>/services</b>
+Browse all available services by platform and category.
+
+{pe('📦')} <b>/order</b>
+Place a new order manually.
+
+<b>How to place an order:</b>
+
+{pe('1️⃣')} Find the service you want from <code>/services</code>.
+
+{pe('2️⃣')} Copy the <b>Service ID</b>.
+Example:
+{pe('🆔')} <code>5092</code> — Instagram Reel + Video Views
+
+{pe('3️⃣')} Enter the Service ID when the bot asks for it.
+
+{pe('4️⃣')} Enter the <b>Link / URL</b> where you want the service.
+
+{pe('5️⃣')} Enter the required <b>Quantity</b>.
+
+{pe('6️⃣')} Check the order details and confirm the order.
+
+{pe('✅')} After successful placement, you will receive your <b>Order ID</b>.
+
+━━━━━━━━━━━━━━━━━━
+
+{pe('📈')} <b>Order Management</b>
+
+{pe('📈')} <b>/status</b>
+Check the current status of one or multiple orders.
+
+Example:
+<code>/status 123456</code>
+
+Multiple orders:
+<code>/status 123456,789012</code>
+
+{pe('🛡️')} <b>/cancel</b>
+Request cancellation for eligible orders.
+
+{pe('📤')} <b>/refill</b>
+Create a refill request for an eligible order.
+
+{pe('📝')} <b>/refillstatus</b>
+Check the status of a refill request.
+
+━━━━━━━━━━━━━━━━━━
+
+{pe('💡')} <b>Quick Tips</b>
+
+• Always use the correct <b>Service ID</b>.
+• Make sure the <b>Link / URL</b> is correct before placing an order.
+• Check the service's <b>minimum and maximum quantity</b> before ordering.
+• Keep your <b>Order ID</b> for future status, cancellation or refill requests.
+• Make sure you have sufficient <b>wallet balance</b> before placing an order.
+
+{pe('ℹ️')} <b>Need Help?</b>
+If you face any issue with an order or payment, contact support with your <b>Order ID</b>."""
+    
+       await self.render(update, context, text=text)
 
     async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -1470,7 +1534,9 @@ Select a category:"""
 
         order_text = (
             f"{pe('📦')} <b>New Order</b>\n\n"
-            f"Enter Service ID (use /services to find):"
+            f"Enter Service ID (use /services to find):\n\n"
+            f"{pe('⬇️')} <b>Service ID Example:</b> <code>5092</code>\n"
+            f"{pe('🆔')} <code>5092</code> - Instagram Reel + Video Views"
         )
 
         try:
