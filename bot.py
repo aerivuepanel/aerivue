@@ -944,7 +944,7 @@ class SMMBot:
             is_new_user = await self.store.ensure_user(user.id, name=name, username=user.username)
 
         text = f"""{pe('🔥')} <b>Welcome {name}!</b>
-{pe('🚀')} <b>EasySMMPanel Bot</b>
+{pe('🚀')} <b>ROSESMM Bot</b>
 
 {pe('📌')} Choose an option below:"""
 
@@ -958,7 +958,7 @@ class SMMBot:
 {pe('👤')} {name} (@{user.username or 'Aerivue'})""")
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = f"""{pe('📖')} <b>EasySMMPanel Bot Commands</b>
+        text = f"""{pe('📖')} <b>ROSESMM Bot Commands</b>
 
 {pe('⭐')} /start - Show main menu
 {pe('ℹ️')} /help - Show this help
