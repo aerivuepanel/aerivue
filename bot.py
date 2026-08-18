@@ -1,36 +1,3 @@
-# DEMON_SMM_BOT_RAZORPAY_PAYMENTLINK.py - Button UI edit + command history + auto payment
-#
-# UX: inline-button flows keep ONE UI message (edit it, or delete/replace only when
-# Telegram requires a media-type change). Commands and normal user messages always
-# create new messages and never delete chat history.
-#
-# 2. <tg-emoji> RAW TAG FALLBACK (kept from v4)
-#    - If Telegram rejects an HTML send (e.g. an invalid custom emoji id), the
-#      fallback strips tags via strip_html() instead of leaking raw markup.
-#
-# 3. HEALTH-CHECK PORT (for host platforms that need an open port to keep the
-#    process alive, e.g. Render/Railway free tiers)
-#    - A tiny background HTTP server binds PORT (env var, default 8080) and
-#      replies "Bot is running" on GET / — separate from Telegram polling, which
-#      still runs via run_polling() as before.
-#
-# 4. ADMIN ALERT ON ORDER FAILURE
-#    - If the panel API rejects an order (e.g. panel balance too low), the admin
-#      now gets a DM with the user, service, quantity, and the panel's raw error
-#      — flagged with a ⚠️ if the error text mentions "balance".
-#
-# 5. @aerivue CHANNEL POSTS
-#    - New user starting the bot for the first time -> a "new user joined" post.
-#    - Every successful order -> a "new order" post (user + service + quantity;
-#      wallet cost is deliberately left out of the public post to keep margin
-#      private — say the word if you want the amount shown too).
-#    - Set CHANNEL_ID env var (default "@aerivue"). The bot must be an admin of
-#      that channel or these posts will silently fail (logged, not crash).
-#
-# MongoDB (motor) + reseller tiered markup pricing kept as in v4.
-#
-# pip install python-telegram-bot==22.7 requests motor pymongo --break-system-packages
-
 import io
 import os
 import json
@@ -495,6 +462,13 @@ class SMMBot:
         self.app.add_handler(CallbackQueryHandler(
             self.order_now_callback,
             pattern="^ord$"))
+        # New browse flow: Platform -> Category -> Services.
+        # Legacy category callbacks are kept below so old UI messages still work.
+        self.app.add_handler(CallbackQueryHandler(self.platform_callback, pattern="^platform_"))
+        self.app.add_handler(CallbackQueryHandler(self.platform_category_page_callback, pattern="^pcatpg_"))
+        self.app.add_handler(CallbackQueryHandler(self.platform_category_callback, pattern="^pcat_"))
+        self.app.add_handler(CallbackQueryHandler(self.platform_service_page_callback, pattern="^psvcpg_"))
+
         self.app.add_handler(CallbackQueryHandler(self.categories_page_callback, pattern="^catpg_"))
         self.app.add_handler(CallbackQueryHandler(self.category_callback, pattern="^cat_"))
         self.app.add_handler(CallbackQueryHandler(self.page_callback, pattern="^pg_"))
@@ -645,6 +619,279 @@ class SMMBot:
             categories.setdefault(self.categorize(service), []).append(service)
         return categories
 
+    # ==================== PLATFORM -> CATEGORY -> SERVICE BROWSE ====================
+    # Extra UI layer only. Existing service, order, payment and pricing logic is untouched.
+
+    PLATFORM_ORDER = (
+        ("instagram", "Instagram", "📸"),
+        ("facebook", "Facebook", "📘"),
+        ("youtube", "YouTube", "▶️"),
+        ("telegram", "Telegram", "✈️"),
+        ("social_other", "TikTok + Twitter", "🎵"),
+        ("website_seo", "Website SEO", "🌐"),
+        ("other", "Other", "📦"),
+    )
+
+    def detect_platform(self, service):
+        name = str(service.get("name", "") or "").lower()
+        category = str(service.get("category", "") or "").lower()
+        text = f"{category} {name}"
+
+        if "instagram" in text:
+            return "instagram"
+        if "facebook" in text:
+            return "facebook"
+        if "youtube" in text:
+            return "youtube"
+        if "telegram" in text:
+            return "telegram"
+        if "tiktok" in text or "twitter" in text:
+            return "social_other"
+        if any(word in text for word in (
+            "website", "seo", "geo", "google analytics", "analytics"
+        )):
+            return "website_seo"
+
+        return "other"
+
+    def extract_platforms(self, services):
+        platforms = {key: [] for key, _, _ in self.PLATFORM_ORDER}
+
+        for service in services:
+            platforms[self.detect_platform(service)].append(service)
+
+        # Don't show an empty "Other" button.
+        if not platforms["other"]:
+            platforms.pop("other", None)
+
+        return platforms
+
+    def get_platform_meta(self, platform_key):
+        for key, label, emoji in self.PLATFORM_ORDER:
+            if key == platform_key:
+                return label, emoji
+        return platform_key.replace("_", " ").title(), "📦"
+
+    async def render_platforms_page(self, update, context):
+        platforms = context.user_data.get("platforms", {})
+        total_services = context.user_data.get("total_services", 0)
+
+        buttons = []
+        for key, label, emoji in self.PLATFORM_ORDER:
+            services = platforms.get(key, [])
+            if not services:
+                continue
+            buttons.append(
+                btn(f"{emoji} {label} ({len(services)})", f"platform_{key}")
+            )
+
+        keyboard = grid(buttons, cols=2)
+        keyboard.append([btn("Main Menu", "menu", emoji="🔑")])
+
+        text = f"""{pe('📌')} <b>Select a Platform</b>
+
+{pe('📦')} {total_services} services total
+
+{pe('📱')} Choose a platform to continue:"""
+
+        await self.render(
+            update,
+            context,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def render_platform_categories_page(
+        self, update, context, platform_key, page=0
+    ):
+        platforms = context.user_data.get("platforms", {})
+        platform_services = platforms.get(platform_key, [])
+
+        if not platform_services:
+            await self.render(
+                update,
+                context,
+                text=f"{pe('ℹ️')} Platform not found — try /services again.",
+                reply_markup=self.menu_kb()
+            )
+            return
+
+        label, emoji = self.get_platform_meta(platform_key)
+
+        categories = self.extract_categories(platform_services)
+        sorted_cats = sorted(categories.keys())
+
+        per_page = CATEGORIES_PER_PAGE
+        total_pages = max(1, (len(sorted_cats) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        start = page * per_page
+        end = min(start + per_page, len(sorted_cats))
+
+        cat_buttons = [
+            btn(
+                f"{sorted_cats[i]} ({len(categories[sorted_cats[i]])})",
+                f"pcat_{platform_key}_{i}",
+                emoji="📦"
+            )
+            for i in range(start, end)
+        ]
+
+        keyboard = grid(cat_buttons, cols=2)
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "‹ Prev",
+                    callback_data=f"pcatpg_{platform_key}_{page - 1}"
+                )
+            )
+
+        nav_row.append(
+            InlineKeyboardButton(
+                f"{page + 1}/{total_pages}",
+                callback_data=f"platform_{platform_key}"
+            )
+        )
+
+        if page < total_pages - 1:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "Next ›",
+                    callback_data=f"pcatpg_{platform_key}_{page + 1}"
+                )
+            )
+
+        keyboard.append(nav_row)
+        keyboard.append([
+            btn("‹ Platforms", "serv", emoji="🌐"),
+            btn("Main Menu", "menu", emoji="🔑")
+        ])
+
+        text = f"""{pe('📌')} <b>{emoji} {label}</b>
+
+{pe('📦')} {len(sorted_cats)} categories · {len(platform_services)} services
+
+{pe('📱')} Select a category:"""
+
+        await self.render(
+            update,
+            context,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def show_platform_category_services(
+        self, update, context, platform_key, cat_index, page=0
+    ):
+        platforms = context.user_data.get("platforms", {})
+        platform_services = platforms.get(platform_key, [])
+
+        if not platform_services:
+            await self.render(
+                update,
+                context,
+                text=f"{pe('ℹ️')} Platform not found — try /services again.",
+                reply_markup=self.menu_kb()
+            )
+            return
+
+        label, emoji = self.get_platform_meta(platform_key)
+
+        categories = self.extract_categories(platform_services)
+        sorted_cats = sorted(categories.keys())
+
+        if cat_index < 0 or cat_index >= len(sorted_cats):
+            await self.render(
+                update,
+                context,
+                text=f"{pe('ℹ️')} Category not found — try /services again.",
+                reply_markup=self.menu_kb()
+            )
+            return
+
+        category = sorted_cats[cat_index]
+        services = categories.get(category, [])
+
+        per_page = SERVICES_PER_PAGE
+        total_pages = max(1, (len(services) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        start = page * per_page
+        end = min(start + per_page, len(services))
+
+        admin = self.is_admin(update)
+        text = (
+            f"{pe('📌')} <b>{label} › {category}</b> "
+            f"({len(services)} services)\n\n"
+        )
+
+        for service in services[start:end]:
+            real_rate = float(service.get("rate", 0) or 0)
+            text += (
+                f"{pe('🆔')} <b>{service.get('service')}</b> - "
+                f"{service.get('name', 'Unknown')[:40]}\n"
+            )
+
+            if admin:
+                text += (
+                    f"   {pe('💰')} Rate/1000: {service.get('rate', 'N/A')} | "
+                    f"Min: {service.get('min', 'N/A')} | "
+                    f"Max: {service.get('max', 'N/A')}\n\n"
+                )
+            else:
+                disp_rate = display_rate_per_1000(real_rate, TIER1_MAX_QTY)
+                text += (
+                    f"   {pe('💰')} Rate/1000: ₹{disp_rate:.2f} | "
+                    f"Min: {service.get('min', 'N/A')} | "
+                    f"Max: {service.get('max', 'N/A')}\n"
+                )
+                text += (
+                    f"   {pe('🔥')} Order {TIER2_MIN_QTY:,}+ "
+                    f"for a bulk discount\n\n"
+                )
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "‹ Prev",
+                    callback_data=f"psvcpg_{platform_key}_{cat_index}_{page - 1}"
+                )
+            )
+
+        nav_row.append(
+            InlineKeyboardButton(
+                f"{page + 1}/{total_pages}",
+                callback_data=f"pcat_{platform_key}_{cat_index}"
+            )
+        )
+
+        if page < total_pages - 1:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "Next ›",
+                    callback_data=f"psvcpg_{platform_key}_{cat_index}_{page + 1}"
+                )
+            )
+
+        keyboard = [nav_row]
+        keyboard += grid([
+            btn("Order Now", "ord", emoji="📦", style="success"),
+            btn("Categories", f"platform_{platform_key}", emoji="📊")
+        ], cols=2)
+        keyboard.append([
+            btn("‹ Platforms", "serv", emoji="🌐"),
+            btn("Main Menu", "menu", emoji="🔑")
+        ])
+
+        await self.render(
+            update,
+            context,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
     async def get_all_services(self, context):
         """Cache the panel's full service list in bot_data (shared, refreshed on /services)."""
         cached = context.bot_data.get('all_services')
@@ -749,13 +996,14 @@ Balance: <code>₹{bal:.2f}</code>"""
             await self.render(update, context, text=f"{pe('ℹ️')} Failed to fetch services.", reply_markup=self.menu_kb())
             return
 
-        categories = self.extract_categories(services)
-        sorted_cats = sorted(categories.keys())
-        context.user_data['categories'] = categories
-        context.user_data['sorted_categories'] = sorted_cats
+        # New browse hierarchy:
+        # Platform -> Category -> Services.
+        # The original category/order logic remains intact below for compatibility.
+        platforms = self.extract_platforms(services)
+        context.user_data['platforms'] = platforms
         context.user_data['total_services'] = len(services)
 
-        await self.render_categories_page(update, context, 0)
+        await self.render_platforms_page(update, context)
 
     async def render_categories_page(self, update, context, page):
         categories = context.user_data.get('categories', {})
@@ -1490,6 +1738,36 @@ Select a category:"""
             "refstat": self.refill_status_command,
         }
         await handlers[data](update, context)
+
+    async def platform_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        platform_key = query.data.split("_", 1)[1]
+        await self.render_platform_categories_page(update, context, platform_key, 0)
+
+    async def platform_category_page_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        _, platform_key, page = query.data.split("_", 2)
+        await self.render_platform_categories_page(
+            update, context, platform_key, int(page)
+        )
+
+    async def platform_category_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        _, platform_key, cat_index = query.data.split("_", 2)
+        await self.show_platform_category_services(
+            update, context, platform_key, int(cat_index), 0
+        )
+
+    async def platform_service_page_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        _, platform_key, cat_index, page = query.data.split("_", 3)
+        await self.show_platform_category_services(
+            update, context, platform_key, int(cat_index), int(page)
+        )
 
     async def categories_page_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
