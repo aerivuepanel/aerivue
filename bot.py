@@ -23,7 +23,8 @@ from pymongo import ReturnDocument
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes,
+    MessageHandler, filters, ContextTypes, TypeHandler,
+    ApplicationHandlerStop,
 )
 from telegram.constants import ParseMode
 
@@ -295,12 +296,14 @@ class Store:
     Collections:
       users          {_id: telegram_user_id, balance, name, username}
       pending        {_id: txn_id, user_id, name, username, amount, utr, screenshot_file_id, created_at}
+      settings       {_id: "config", force_join_enabled, force_join_channel, force_join_invite_link}
     """
     def __init__(self, uri, db_name):
         self.client = AsyncIOMotorClient(uri)
         self.db = self.client[db_name]
         self.users = self.db.users
         self.pending = self.db.pending_payments
+        self.settings = self.db.settings
 
     async def ensure_indexes(self):
         await self.users.create_index("_id")
@@ -437,6 +440,29 @@ class Store:
 
         return {**claimed, "new_balance": new_balance}, "credited"
 
+    # ---- admin settings (force join) ----
+    async def get_settings(self) -> dict:
+        doc = await self.settings.find_one({"_id": "config"})
+        return doc or {}
+
+    async def update_settings(self, fields: dict):
+        await self.settings.update_one({"_id": "config"}, {"$set": fields}, upsert=True)
+
+    # ---- broadcast / stats ----
+    async def all_user_ids(self):
+        ids = []
+        async for doc in self.users.find({}, {"_id": 1}):
+            ids.append(doc["_id"])
+        return ids
+
+    async def user_count(self) -> int:
+        return await self.users.count_documents({})
+
+    async def total_wallet_balance(self) -> float:
+        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$balance"}}}]
+        result = await self.users.aggregate(pipeline).to_list(length=1)
+        return float(result[0]["total"]) if result else 0.0
+
 # ==================== MAIN BOT ====================
 class SMMBot:
     def __init__(self, token, api_key):
@@ -456,6 +482,16 @@ class SMMBot:
         self.app.add_handler(CommandHandler("refill", self.refill_command))
         self.app.add_handler(CommandHandler("refillstatus", self.refill_status_command))
         self.app.add_handler(CommandHandler("payment", self.payment_command))
+        self.app.add_handler(CommandHandler("admin", self.admin_command))
+
+        # Force-join gate — runs before every other handler (group=-1) so it
+        # never touches any of the existing user-facing logic below. It only
+        # blocks updates when the admin has force-join turned ON.
+        self.app.add_handler(TypeHandler(Update, self.force_join_gate), group=-1)
+        self.app.add_handler(CallbackQueryHandler(self.force_join_verify_callback, pattern="^fjverify$"))
+
+        # Admin control panel (force join on/off, channel, broadcast, stats).
+        self.app.add_handler(CallbackQueryHandler(self.admin_panel_callback, pattern="^adm_"))
 
         # Normal inline-button callbacks.
         # "ord" is intentionally excluded because Order Now must start
@@ -481,6 +517,18 @@ class SMMBot:
         self.app.add_handler(CallbackQueryHandler(self.payment_callback, pattern="^payamt_"))
         self.app.add_handler(CallbackQueryHandler(self.order_confirm_callback, pattern="^ordconfirm$"))
         self.app.add_handler(CallbackQueryHandler(self.order_cancel_callback, pattern="^ordcancel$"))
+
+        # Admin-only: catches media (photo/video/document/animation/audio/voice)
+        # sent while a broadcast is pending. Anything the admin sends that is
+        # NOT part of a broadcast flow is simply ignored here and never
+        # interferes with the text-based flows below.
+        self.app.add_handler(MessageHandler(
+            filters.User(ADMIN_ID) & (
+                filters.PHOTO | filters.VIDEO | filters.Document.ALL |
+                filters.ANIMATION | filters.AUDIO | filters.VOICE
+            ) & ~filters.COMMAND,
+            self.handle_admin_media
+        ))
 
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
@@ -605,6 +653,93 @@ class SMMBot:
         """True only when the current screen was triggered by an inline button."""
         return getattr(update, "callback_query", None) is not None
 
+    # ==================== FORCE JOIN ====================
+    async def is_user_joined(self, context, user_id, channel) -> bool:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+            return member.status not in ("left", "kicked")
+        except Exception as e:
+            # Fail OPEN so a misconfigured / wrong channel never locks everyone
+            # out of the bot. Admin should verify with the panel after setup.
+            logger.warning("Force-join check failed for channel %s: %s", channel, e)
+            return True
+
+    async def force_join_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user or user.id == ADMIN_ID:
+            return
+
+        query = getattr(update, "callback_query", None)
+        if query and query.data == "fjverify":
+            return  # let the dedicated verify handler process this tap
+
+        settings = await self.store.get_settings()
+        if not settings.get("force_join_enabled"):
+            return
+
+        channel = settings.get("force_join_channel")
+        if not channel:
+            return
+
+        if query:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+
+        joined = await self.is_user_joined(context, user.id, channel)
+        if joined:
+            return
+
+        invite_link = settings.get("force_join_invite_link") or (
+            f"https://t.me/{channel[1:]}" if str(channel).startswith("@") else None
+        )
+        buttons = []
+        if invite_link:
+            buttons.append([InlineKeyboardButton(f"{pe('📢')} Join Channel", url=invite_link)])
+        buttons.append([btn("I've Joined", "fjverify", emoji="✅", style="success")])
+
+        text = (
+            f"{pe('🛡️')} <b>Join Our Channel to Continue</b>\n\n"
+            f"{pe('ℹ️')} You must join our official channel before using this bot.\n"
+            f"{pe('📌')} Tap <b>Join Channel</b>, then tap <b>I've Joined</b>."
+        )
+        chat_id = update.effective_chat.id if update.effective_chat else user.id
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text,
+                reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.warning("Could not send force-join prompt: %s", e)
+
+        raise ApplicationHandlerStop
+
+    async def force_join_verify_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user = update.effective_user
+        settings = await self.store.get_settings()
+        channel = settings.get("force_join_channel")
+
+        if not channel or not settings.get("force_join_enabled"):
+            await query.answer("Force join is not active.", show_alert=True)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            return
+
+        joined = await self.is_user_joined(context, user.id, channel)
+        if not joined:
+            await query.answer("You haven't joined yet. Please join first.", show_alert=True)
+            return
+
+        await query.answer("Verified! You can use the bot now.")
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await self.start_command(update, context)
 
     # ==================== CATEGORIES ====================
     def categorize(self, service):
@@ -920,6 +1055,166 @@ class SMMBot:
     def is_admin(self, update) -> bool:
         return bool(update.effective_user) and update.effective_user.id == ADMIN_ID
 
+    # ==================== ADMIN PANEL ====================
+    async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_admin(update):
+            return
+        await self.render_admin_panel(update, context)
+
+    async def render_admin_panel(self, update, context):
+        settings = await self.store.get_settings()
+        fj_on = bool(settings.get("force_join_enabled", False))
+        channel = settings.get("force_join_channel") or "Not set"
+
+        keyboard = grid([
+            btn(f"Force Join: {'ON' if fj_on else 'OFF'}", "adm_fjtoggle",
+                emoji="🛡️", style="success" if fj_on else "danger"),
+            btn("Set Force Join Channel", "adm_fjset", emoji="📌"),
+            btn("Broadcast", "adm_broadcast", emoji="📤", style="primary"),
+            btn("Stats", "adm_stats", emoji="📊", style="primary"),
+        ], cols=2)
+        keyboard.append([btn("Main Menu", "menu", emoji="🔑")])
+
+        text = f"""{pe('🛡️')} <b>Admin Control Panel</b>
+
+{pe('📌')} Force Join: <b>{'ON' if fj_on else 'OFF'}</b>
+{pe('🌐')} Channel: <code>{html.escape(str(channel))}</code>
+
+{pe('ℹ️')} Choose an option:"""
+        await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def admin_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self.is_admin(update):
+            await query.answer("Admins only.", show_alert=True)
+            return
+        await query.answer()
+        data = query.data
+
+        if data == "adm_panel":
+            await self.render_admin_panel(update, context)
+            return
+
+        if data == "adm_fjtoggle":
+            settings = await self.store.get_settings()
+            new_state = not settings.get("force_join_enabled", False)
+            if new_state and not settings.get("force_join_channel"):
+                await query.answer("Set a force join channel first.", show_alert=True)
+                await self.render_admin_panel(update, context)
+                return
+            await self.store.update_settings({"force_join_enabled": new_state})
+            await self.render_admin_panel(update, context)
+            return
+
+        if data == "adm_fjset":
+            context.user_data['fj_setchannel_step'] = 'id'
+            await self.render(
+                update, context,
+                text=(f"{pe('📌')} Send the channel <b>username</b> (e.g. <code>@mychannel</code>) "
+                      f"or numeric chat ID (e.g. <code>-1001234567890</code>).\n\n"
+                      f"{pe('ℹ️')} The bot must be an admin of that channel.")
+            )
+            return
+
+        if data == "adm_broadcast":
+            context.user_data['broadcast_step'] = True
+            await self.render(
+                update, context,
+                text=(f"{pe('📤')} <b>Broadcast</b>\n\nSend the message (text, photo, video, "
+                      f"or file) you want to broadcast to all users.")
+            )
+            return
+
+        if data == "adm_stats":
+            count = await self.store.user_count()
+            total_bal = await self.store.total_wallet_balance()
+            text = f"""{pe('📊')} <b>Bot Stats</b>
+
+{pe('👤')} Total Users: <b>{count}</b>
+{pe('💰')} Total Wallet Balance: ₹{total_bal:.2f}"""
+            await self.render(
+                update, context, text=text,
+                reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
+            )
+            return
+
+        if data == "adm_bcast_confirm":
+            await self.run_broadcast(update, context)
+            return
+
+        if data == "adm_bcast_cancel":
+            context.user_data.pop('broadcast_pending', None)
+            await self.render(
+                update, context, text=f"{pe('ℹ️')} Broadcast cancelled.",
+                reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
+            )
+            return
+
+    async def handle_admin_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Only reacts when a broadcast is pending — anything else the admin
+        sends here is left completely alone."""
+        if not context.user_data.get('broadcast_step'):
+            return
+        context.user_data.pop('broadcast_step', None)
+        context.user_data['broadcast_pending'] = {
+            'chat_id': update.effective_chat.id,
+            'message_id': update.message.message_id,
+        }
+        await self.render_broadcast_preview(update, context)
+
+    async def render_broadcast_preview(self, update, context):
+        count = await self.store.user_count()
+        keyboard = InlineKeyboardMarkup(grid([
+            btn("Confirm & Send", "adm_bcast_confirm", emoji="✅", style="success"),
+            btn("Cancel", "adm_bcast_cancel", emoji="🛡️", style="danger"),
+        ], cols=2))
+        await self.render(
+            update, context,
+            text=(f"{pe('📤')} <b>Broadcast Preview</b>\n\n{pe('👤')} Will be sent to "
+                  f"<b>{count}</b> users.\n{pe('ℹ️')} Confirm to send now."),
+            reply_markup=keyboard,
+        )
+
+    async def run_broadcast(self, update, context):
+        pending = context.user_data.pop('broadcast_pending', None)
+        if not pending:
+            await self.render(
+                update, context, text=f"{pe('ℹ️')} Nothing to broadcast.",
+                reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
+            )
+            return
+
+        await self.render(update, context, text=f"{pe('⏱️')} Broadcasting... this may take a while.")
+
+        user_ids = await self.store.all_user_ids()
+        sent, failed = 0, 0
+        for uid in user_ids:
+            try:
+                # copy_message resends the content (text/photo/video/document/...)
+                # as a brand-new message with NO "Forwarded from" header.
+                await context.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=pending['chat_id'],
+                    message_id=pending['message_id'],
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.info("Broadcast failed for %s: %s", uid, e)
+            await asyncio.sleep(0.05)
+
+        text = f"""{pe('✅')} <b>Broadcast Complete</b>
+
+{pe('👤')} Sent: {sent}
+{pe('ℹ️')} Failed: {failed}"""
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, text=text, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
+            )
+        except Exception as e:
+            logger.error("Could not send broadcast summary to admin: %s", e)
+
     # ==================== COMMANDS ====================
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -937,9 +1232,13 @@ class SMMBot:
             btn("Refill", "ref", emoji="📤", style="primary"),
             btn("Refill Status", "refstat", emoji="📝", style="primary"),
         ], cols=2)
-        reply_markup = InlineKeyboardMarkup(keyboard)
 
         user = update.effective_user
+        if user and user.id == ADMIN_ID:
+            keyboard.append([btn("Admin Panel", "adm_panel", emoji="🛡️", style="danger")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
         name = user.first_name if user else "User"
         is_new_user = False
         if user and user.id != ADMIN_ID:
@@ -1666,6 +1965,40 @@ Select a category:"""
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_input = update.message.text.strip()
 
+        # ---- Admin: set force-join channel (step 1: id/username) ----
+        if context.user_data.get('fj_setchannel_step') == 'id':
+            context.user_data['fj_new_channel'] = user_input
+            context.user_data['fj_setchannel_step'] = 'link'
+            await self.render(
+                update, context,
+                text=f"{pe('📌')} Now send the invite link for that channel (e.g. https://t.me/yourchannel or a private invite link)."
+            )
+            return
+
+        # ---- Admin: set force-join channel (step 2: invite link) ----
+        if context.user_data.get('fj_setchannel_step') == 'link':
+            channel = context.user_data.pop('fj_new_channel', None)
+            context.user_data.pop('fj_setchannel_step', None)
+            await self.store.update_settings({
+                "force_join_channel": channel,
+                "force_join_invite_link": user_input,
+            })
+            await self.render(
+                update, context, text=f"{pe('✅')} Force join channel updated.",
+                reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
+            )
+            return
+
+        # ---- Admin: broadcast (text content) ----
+        if context.user_data.get('broadcast_step'):
+            context.user_data.pop('broadcast_step', None)
+            context.user_data['broadcast_pending'] = {
+                'chat_id': update.effective_chat.id,
+                'message_id': update.message.message_id,
+            }
+            await self.render_broadcast_preview(update, context)
+            return
+
         # ---- Custom payment amount ----
         if context.user_data.get('payment_step') == 'custom':
             try:
@@ -1921,7 +2254,7 @@ Select a category:"""
         start_health_server(PORT)
         print(f"""
 +===================================================+
-|  DEMON SMM BOT v11.0 - NO-DELETE UX + LIVE ALERTS  |
+|  DEMON SMM BOT v12.0 - FORCE JOIN + ADMIN PANEL    |
 |  Status: RUNNING (polling)                         |
 |  Health check: http://0.0.0.0:{PORT}/  -> "Bot is running"
 +===================================================+
