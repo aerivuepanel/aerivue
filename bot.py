@@ -741,7 +741,8 @@ class SMMBot:
             for i in range(start, end)
         ]
 
-        keyboard = grid(cat_buttons, cols=2)
+        # 1 category per row (was cols=2)
+        keyboard = grid(cat_buttons, cols=1)
 
         nav_row = []
         if page > 0:
@@ -1218,8 +1219,8 @@ Select a category:"""
 
         pl = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
         payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
-        payment_id = payment.get("id") or payload.get("id") or f"plink:{payment_link_id}"
         payment_link_id = pl.get("id") or ""
+        payment_id = payment.get("id") or payload.get("id") or f"plink:{payment_link_id}"
         amount_paise = int(payment.get("amount", 0) or pl.get("amount_paid", 0) or 0)
         status = payment.get("status") or "captured"
         currency = payment.get("currency") or pl.get("currency") or "INR"
@@ -1277,6 +1278,23 @@ Select a category:"""
             )
         except Exception as exc:
             logger.error("Could not notify admin after Razorpay payment %s: %s", payment_id, exc)
+
+        # Group/channel announcement — payment details (user id, username, amount, txn)
+        try:
+            await self.app.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=(
+                    f"{pe('💰')} <b>New Payment Received!</b>\n\n"
+                    f"{pe('👤')} User ID: <code>{uid}</code>\n"
+                    f"{pe('👤')} Name: {info.get('name', '')} (@{info.get('username') or 'aerivue'})\n"
+                    f"{pe('💰')} Amount: ₹{amount:.2f}\n"
+                    f"{pe('🆔')} Payment: <code>{payment_id}</code>\n"
+                    f"{pe('📌')} TXN: <code>{txn_id}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.error("Could not post payment to channel %s: %s", CHANNEL_ID, exc)
 
     async def paid_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """User claims they've paid -> ask for screenshot, then UTR, before it ever reaches admin."""
@@ -1383,6 +1401,22 @@ Select a category:"""
                     parse_mode=ParseMode.HTML)
             except Exception as e:
                 logger.error(f"Could not notify user of approval: {e}")
+
+            # Group/channel announcement — payment details (user id, username, amount, txn)
+            try:
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=(
+                        f"{pe('💰')} <b>New Payment Approved!</b>\n\n"
+                        f"{pe('👤')} User ID: <code>{target_uid}</code>\n"
+                        f"{pe('👤')} Name: {info.get('name', '')} (@{info.get('username') or 'aerivue'})\n"
+                        f"{pe('💰')} Amount: ₹{amount}\n"
+                        f"{pe('📌')} TXN: <code>{txn_id}</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.error(f"Could not post payment to channel {CHANNEL_ID}: {e}")
         else:
             result_text = f"{pe('🛡️')} <b>Rejected</b> — no balance added."
             try:
@@ -1510,9 +1544,12 @@ Select a category:"""
                 context,
                 f"""{pe('📦')} <b>New Order!</b>
 
-{pe('👤')} {user.first_name} (@{user.username or 'aerivue'}) just bought:
-{pe('📌')} {pending['category']} — Service #{pending['service_id']}
-{pe('📊')} Quantity: {pending['quantity']}""")
+{pe('👤')} <b>User:</b> {user.first_name} (@{user.username or 'aerivue'})
+{pe('🆔')} <b>Order ID:</b> <code>{result['order']}</code>
+{pe('📌')} <b>Service:</b> {pending['category']} — #{pending['service_id']}
+{pe('🔗')} <b>Link:</b> <code>{pending['link']}</code>
+{pe('📊')} <b>Quantity:</b> {pending['quantity']}
+{pe('💰')} <b>Amount:</b> ₹{cost:.2f}""")
         else:
             # API failed after we deducted -> refund
             await self.store.add_balance(user.id, cost)
