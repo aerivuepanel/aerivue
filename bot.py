@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import time
 import asyncio
+import html
 import re
 import random
 import logging
@@ -1613,7 +1614,7 @@ Select a category:"""
 {pe('👤')} <b>User:</b> {user.first_name} (@{user.username or ''})
 {pe('🆔')} <b>Order ID:</b> <code>{result['order']}</code>
 {pe('📌')} <b>Service:</b> {pending['category']} — #{pending['service_id']}
-{pe('🔗')} <b>Link:</b> <code>{pending['link']}</code>
+{pe('🔗')} <b>Link:</b> <a href="{html.escape(pending['link'], quote=True)}">{html.escape(pending['link'])}</a>
 {pe('📊')} <b>Quantity:</b> {pending['quantity']}
 {pe('💰')} <b>Amount:</b> ₹{cost:.2f}""")
         else:
