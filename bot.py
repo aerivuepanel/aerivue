@@ -682,7 +682,7 @@ class SMMBot:
             if not services:
                 continue
             buttons.append(
-                btn(f"{emoji} {label} ({len(services)})", f"platform_{key}")
+                 btn(f"{label} ({len(services)})", f"platform_{key}", emoji=emoji, style="primary")
             )
 
         keyboard = grid(buttons, cols=2)
