@@ -296,7 +296,7 @@ class Store:
     Collections:
       users          {_id: telegram_user_id, balance, name, username}
       pending        {_id: txn_id, user_id, name, username, amount, utr, screenshot_file_id, created_at}
-      settings       {_id: "config", force_join_enabled, force_join_channel, force_join_invite_link}
+      settings       {_id: "config", force_join_enabled, force_join_channels: [{channel, invite_link}, ...]}
     """
     def __init__(self, uri, db_name):
         self.client = AsyncIOMotorClient(uri)
@@ -447,6 +447,22 @@ class Store:
 
     async def update_settings(self, fields: dict):
         await self.settings.update_one({"_id": "config"}, {"$set": fields}, upsert=True)
+
+    async def add_force_join_channel(self, channel: str, invite_link: str):
+        """Adds a channel to the force-join list (replaces it if already present)."""
+        settings = await self.get_settings()
+        channels = settings.get("force_join_channels") or []
+        channels = [c for c in channels if c.get("channel") != channel]
+        channels.append({"channel": channel, "invite_link": invite_link})
+        await self.update_settings({"force_join_channels": channels})
+
+    async def remove_force_join_channel(self, index: int):
+        settings = await self.get_settings()
+        channels = settings.get("force_join_channels") or []
+        if 0 <= index < len(channels):
+            channels.pop(index)
+            await self.update_settings({"force_join_channels": channels})
+        return channels
 
     # ---- broadcast / stats ----
     async def all_user_ids(self):
@@ -677,8 +693,8 @@ class SMMBot:
         if not settings.get("force_join_enabled"):
             return
 
-        channel = settings.get("force_join_channel")
-        if not channel:
+        channels = settings.get("force_join_channels") or []
+        if not channels:
             return
 
         if query:
@@ -687,22 +703,15 @@ class SMMBot:
             except Exception:
                 pass
 
-        joined = await self.is_user_joined(context, user.id, channel)
-        if joined:
+        unjoined = await self.get_unjoined_channels(context, user.id, channels)
+        if not unjoined:
             return
 
-        invite_link = settings.get("force_join_invite_link") or (
-            f"https://t.me/{channel[1:]}" if str(channel).startswith("@") else None
-        )
-        buttons = []
-        if invite_link:
-            buttons.append([InlineKeyboardButton(f"{pe('📢')} Join Channel", url=invite_link)])
-        buttons.append([btn("I've Joined", "fjverify", emoji="✅", style="success")])
-
+        buttons = self.build_force_join_buttons(unjoined)
         text = (
-            f"{pe('🛡️')} <b>Join Our Channel to Continue</b>\n\n"
-            f"{pe('ℹ️')} You must join our official channel before using this bot.\n"
-            f"{pe('📌')} Tap <b>Join Channel</b>, then tap <b>I've Joined</b>."
+            f"{pe('🛡️')} <b>Join Our Channel(s) to Continue</b>\n\n"
+            f"{pe('ℹ️')} You must join {'all of ' if len(unjoined) > 1 else ''}the channel(s) below before using this bot.\n"
+            f"{pe('📌')} Tap each <b>Join</b> button, then tap <b>I've Joined</b>."
         )
         chat_id = update.effective_chat.id if update.effective_chat else user.id
         try:
@@ -715,13 +724,34 @@ class SMMBot:
 
         raise ApplicationHandlerStop
 
+    async def get_unjoined_channels(self, context, user_id, channels):
+        unjoined = []
+        for ch in channels:
+            joined = await self.is_user_joined(context, user_id, ch.get("channel"))
+            if not joined:
+                unjoined.append(ch)
+        return unjoined
+
+    def build_force_join_buttons(self, channels):
+        buttons = []
+        for ch in channels:
+            channel = ch.get("channel")
+            invite_link = ch.get("invite_link") or (
+                f"https://t.me/{channel[1:]}" if str(channel).startswith("@") else None
+            )
+            label = channel if str(channel).startswith("@") else "Channel"
+            if invite_link:
+                buttons.append([InlineKeyboardButton(f"{pe('📢')} Join {label}", url=invite_link)])
+        buttons.append([btn("I've Joined All", "fjverify", emoji="✅", style="success")])
+        return buttons
+
     async def force_join_verify_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user = update.effective_user
         settings = await self.store.get_settings()
-        channel = settings.get("force_join_channel")
+        channels = settings.get("force_join_channels") or []
 
-        if not channel or not settings.get("force_join_enabled"):
+        if not channels or not settings.get("force_join_enabled"):
             await query.answer("Force join is not active.", show_alert=True)
             try:
                 await query.message.delete()
@@ -729,9 +759,15 @@ class SMMBot:
                 pass
             return
 
-        joined = await self.is_user_joined(context, user.id, channel)
-        if not joined:
-            await query.answer("You haven't joined yet. Please join first.", show_alert=True)
+        unjoined = await self.get_unjoined_channels(context, user.id, channels)
+        if unjoined:
+            await query.answer("You haven't joined all channels yet.", show_alert=True)
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(self.build_force_join_buttons(unjoined))
+                )
+            except Exception:
+                pass
             return
 
         await query.answer("Verified! You can use the bot now.")
@@ -1064,12 +1100,12 @@ class SMMBot:
     async def render_admin_panel(self, update, context):
         settings = await self.store.get_settings()
         fj_on = bool(settings.get("force_join_enabled", False))
-        channel = settings.get("force_join_channel") or "Not set"
+        channels = settings.get("force_join_channels") or []
 
         keyboard = grid([
             btn(f"Force Join: {'ON' if fj_on else 'OFF'}", "adm_fjtoggle",
                 emoji="🛡️", style="success" if fj_on else "danger"),
-            btn("Set Force Join Channel", "adm_fjset", emoji="📌"),
+            btn(f"Manage Channels ({len(channels)})", "adm_fjmanage", emoji="📌"),
             btn("Broadcast", "adm_broadcast", emoji="📤", style="primary"),
             btn("Stats", "adm_stats", emoji="📊", style="primary"),
         ], cols=2)
@@ -1078,9 +1114,31 @@ class SMMBot:
         text = f"""{pe('🛡️')} <b>Admin Control Panel</b>
 
 {pe('📌')} Force Join: <b>{'ON' if fj_on else 'OFF'}</b>
-{pe('🌐')} Channel: <code>{html.escape(str(channel))}</code>
+{pe('🌐')} Channels added: <b>{len(channels)}</b>
 
 {pe('ℹ️')} Choose an option:"""
+        await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def render_manage_channels(self, update, context):
+        settings = await self.store.get_settings()
+        channels = settings.get("force_join_channels") or []
+
+        keyboard = []
+        for i, ch in enumerate(channels):
+            keyboard.append([btn(f"❌ Remove {ch.get('channel')}", f"adm_fjrm_{i}", emoji="🛡️", style="danger")])
+        keyboard.append([btn("Add Channel", "adm_fjadd", emoji="📌", style="success")])
+        keyboard.append([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")])
+
+        if channels:
+            listing = "\n".join(f"{i + 1}. <code>{html.escape(str(c.get('channel')))}</code>" for i, c in enumerate(channels))
+        else:
+            listing = f"{pe('ℹ️')} No channels added yet."
+
+        text = f"""{pe('📌')} <b>Force Join Channels</b> ({len(channels)})
+
+{listing}
+
+{pe('ℹ️')} Users must join ALL of these to use the bot when Force Join is ON."""
         await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def admin_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1098,15 +1156,19 @@ class SMMBot:
         if data == "adm_fjtoggle":
             settings = await self.store.get_settings()
             new_state = not settings.get("force_join_enabled", False)
-            if new_state and not settings.get("force_join_channel"):
-                await query.answer("Set a force join channel first.", show_alert=True)
+            if new_state and not (settings.get("force_join_channels") or []):
+                await query.answer("Add at least one force join channel first.", show_alert=True)
                 await self.render_admin_panel(update, context)
                 return
             await self.store.update_settings({"force_join_enabled": new_state})
             await self.render_admin_panel(update, context)
             return
 
-        if data == "adm_fjset":
+        if data == "adm_fjmanage":
+            await self.render_manage_channels(update, context)
+            return
+
+        if data == "adm_fjadd":
             context.user_data['fj_setchannel_step'] = 'id'
             await self.render(
                 update, context,
@@ -1114,6 +1176,15 @@ class SMMBot:
                       f"or numeric chat ID (e.g. <code>-1001234567890</code>).\n\n"
                       f"{pe('ℹ️')} The bot must be an admin of that channel.")
             )
+            return
+
+        if data.startswith("adm_fjrm_"):
+            try:
+                index = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                index = -1
+            await self.store.remove_force_join_channel(index)
+            await self.render_manage_channels(update, context)
             return
 
         if data == "adm_broadcast":
@@ -1979,14 +2050,9 @@ Select a category:"""
         if context.user_data.get('fj_setchannel_step') == 'link':
             channel = context.user_data.pop('fj_new_channel', None)
             context.user_data.pop('fj_setchannel_step', None)
-            await self.store.update_settings({
-                "force_join_channel": channel,
-                "force_join_invite_link": user_input,
-            })
-            await self.render(
-                update, context, text=f"{pe('✅')} Force join channel updated.",
-                reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
-            )
+            await self.store.add_force_join_channel(channel, user_input)
+            await self.render(update, context, text=f"{pe('✅')} Channel added to force join list.")
+            await self.render_manage_channels(update, context)
             return
 
         # ---- Admin: broadcast (text content) ----
