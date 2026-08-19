@@ -299,6 +299,7 @@ class Store:
       settings       {_id: "config", force_join_enabled, force_join_channels: [{channel, invite_link}, ...],
                        low_balance_threshold, low_balance_last_alert}
       service_pricing {_id: service_id, markup_percent}   # per-service admin price override
+      admins         {_id: telegram_user_id, name, added_by, added_at}  # sub-admins (owner is ADMIN_ID, not stored here)
     """
     def __init__(self, uri, db_name):
         self.client = AsyncIOMotorClient(uri)
@@ -307,6 +308,7 @@ class Store:
         self.pending = self.db.pending_payments
         self.settings = self.db.settings
         self.service_pricing = self.db.service_pricing
+        self.admins = self.db.admins
 
     async def ensure_indexes(self):
         await self.users.create_index("_id")
@@ -511,12 +513,36 @@ class Store:
         cursor = self.pending.find({"user_id": uid, "status": "credited"}).sort("credited_at", -1).limit(limit)
         return [doc async for doc in cursor]
 
+    # ---- sub-admins (only the owner in ADMIN_ID can add/remove these) ----
+    async def add_admin(self, uid: int, name: str = None, added_by: int = None):
+        await self.admins.update_one(
+            {"_id": uid},
+            {"$set": {"name": name or "", "added_by": added_by, "added_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+
+    async def remove_admin(self, uid: int):
+        await self.admins.delete_one({"_id": uid})
+
+    async def list_admin_ids(self):
+        ids = []
+        async for doc in self.admins.find({}, {"_id": 1}):
+            ids.append(doc["_id"])
+        return ids
+
+    async def list_admins(self):
+        return [doc async for doc in self.admins.find({})]
+
 # ==================== MAIN BOT ====================
 class SMMBot:
     def __init__(self, token, api_key):
         self.app = Application.builder().token(token).build()
         self.api = EasySMMAPI(api_key)
         self.store = Store(MONGO_URI, MONGO_DB_NAME)
+        # In-memory cache of who currently has admin-panel access (owner + sub-admins),
+        # kept in sync with the DB so is_admin()/is_owner() can stay plain sync checks
+        # without touching every existing call site.
+        self.admin_ids = {ADMIN_ID}
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -567,14 +593,12 @@ class SMMBot:
         self.app.add_handler(CallbackQueryHandler(self.order_cancel_callback, pattern="^ordcancel$"))
 
         # Admin-only: catches media (photo/video/document/animation/audio/voice)
-        # sent while a broadcast is pending. Anything the admin sends that is
-        # NOT part of a broadcast flow is simply ignored here and never
-        # interferes with the text-based flows below.
+        # sent while a broadcast is pending. The is_admin() check happens inside
+        # handle_admin_media itself (so sub-admins are included too), and it's a
+        # no-op for anyone not mid-broadcast — never interferes with normal chats.
         self.app.add_handler(MessageHandler(
-            filters.User(ADMIN_ID) & (
-                filters.PHOTO | filters.VIDEO | filters.Document.ALL |
-                filters.ANIMATION | filters.AUDIO | filters.VOICE
-            ) & ~filters.COMMAND,
+            (filters.PHOTO | filters.VIDEO | filters.Document.ALL |
+             filters.ANIMATION | filters.AUDIO | filters.VOICE) & ~filters.COMMAND,
             self.handle_admin_media
         ))
 
@@ -714,7 +738,7 @@ class SMMBot:
 
     async def force_join_gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not user or user.id == ADMIN_ID:
+        if not user or user.id in self.admin_ids:
             return
 
         query = getattr(update, "callback_query", None)
@@ -1029,7 +1053,7 @@ class SMMBot:
         start = page * per_page
         end = min(start + per_page, len(services))
 
-        admin = self.is_admin(update)
+        admin = self.is_owner(update)
         overrides = {} if admin else await self.store.get_all_service_markups()
         text = (
             f"{pe('📌')} <b>{label} › {category}</b> "
@@ -1131,6 +1155,14 @@ class SMMBot:
         return None
 
     def is_admin(self, update) -> bool:
+        """True for the owner (ADMIN_ID) AND any sub-admin added via the panel.
+        Grants Admin Panel access — management + operational tools."""
+        return bool(update.effective_user) and update.effective_user.id in self.admin_ids
+
+    def is_owner(self, update) -> bool:
+        """True ONLY for ADMIN_ID from the environment. Used for: adding/removing
+        sub-admins, seeing raw (no-markup) SMM panel pricing/balance, and setting
+        a service's custom markup below the +10% floor sub-admins are held to."""
         return bool(update.effective_user) and update.effective_user.id == ADMIN_ID
 
     # ==================== ADMIN PANEL ====================
@@ -1144,6 +1176,7 @@ class SMMBot:
         fj_on = bool(settings.get("force_join_enabled", False))
         channels = settings.get("force_join_channels") or []
         threshold = float(settings.get("low_balance_threshold", 0) or 0)
+        owner = self.is_owner(update)
 
         keyboard = grid([
             btn(f"Force Join: {'ON' if fj_on else 'OFF'}", "adm_fjtoggle",
@@ -1155,15 +1188,48 @@ class SMMBot:
             btn("User Lookup", "adm_userlookup", emoji="👤", style="primary"),
             btn(f"Low Balance: {'ON' if threshold > 0 else 'OFF'}", "adm_lowbal", emoji="ℹ️", style="primary"),
         ], cols=2)
+        if owner:
+            sub_admin_count = len(self.admin_ids) - 1
+            keyboard.append([btn(f"Manage Admins ({sub_admin_count})", "adm_admmanage", emoji="👑", style="danger")])
         keyboard.append([btn("Main Menu", "menu", emoji="🔑")])
 
-        text = f"""{pe('🛡️')} <b>Admin Control Panel</b>
+        text = f"""{pe('🛡️')} <b>Admin Control Panel</b>{' (Owner)' if owner else ' (Sub-Admin)'}
 
 {pe('📌')} Force Join: <b>{'ON' if fj_on else 'OFF'}</b>
 {pe('🌐')} Channels added: <b>{len(channels)}</b>
 {pe('💰')} Low Balance Alert: <b>{'₹' + f'{threshold:.2f}' if threshold > 0 else 'OFF'}</b>
 
 {pe('ℹ️')} Choose an option:"""
+        await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # ---- Sub-admin management (owner only) ----
+    async def render_manage_admins(self, update, context):
+        if not self.is_owner(update):
+            await self.render(
+                update, context, text=f"{pe('ℹ️')} Only the owner can manage admins.",
+                reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
+            )
+            return
+
+        admins = await self.store.list_admins()
+        keyboard = []
+        for a in admins:
+            uid = a["_id"]
+            label = a.get("name") or str(uid)
+            keyboard.append([btn(f"❌ Remove {label} ({uid})", f"adm_admrm_{uid}", emoji="🛡️", style="danger")])
+        keyboard.append([btn("Add Admin", "adm_admadd", emoji="👑", style="success")])
+        keyboard.append([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")])
+
+        if admins:
+            listing = "\n".join(f"{i + 1}. {html.escape(a.get('name') or 'Unknown')} — <code>{a['_id']}</code>" for i, a in enumerate(admins))
+        else:
+            listing = f"{pe('ℹ️')} No sub-admins added yet."
+
+        text = f"""{pe('👑')} <b>Manage Admins</b> ({len(admins)})
+
+{listing}
+
+{pe('ℹ️')} Sub-admins get full Admin Panel access (force join, broadcast, pricing, stats, user lookup, low balance alert) but CANNOT add/remove other admins, and their custom service pricing can't go below +10% markup. Only you (the owner) are exempt from that floor."""
         await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def render_manage_channels(self, update, context):
@@ -1378,9 +1444,42 @@ class SMMBot:
             await self.render_low_balance_panel(update, context)
             return
 
+        if data == "adm_admmanage":
+            await self.render_manage_admins(update, context)
+            return
+
+        if data == "adm_admadd":
+            if not self.is_owner(update):
+                await query.answer("Only the owner can add admins.", show_alert=True)
+                return
+            context.user_data['newadmin_step'] = True
+            await self.render(
+                update, context,
+                text=(f"{pe('👑')} Send the numeric Telegram User ID to make an admin.\n\n"
+                      f"{pe('ℹ️')} They should send /start to the bot at least once first "
+                      f"(so the bot can message them / they can use the panel).")
+            )
+            return
+
+        if data.startswith("adm_admrm_"):
+            if not self.is_owner(update):
+                await query.answer("Only the owner can remove admins.", show_alert=True)
+                return
+            try:
+                uid = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                uid = None
+            if uid is not None:
+                await self.store.remove_admin(uid)
+                self.admin_ids.discard(uid)
+            await self.render_manage_admins(update, context)
+            return
+
     async def handle_admin_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Only reacts when a broadcast is pending — anything else the admin
-        sends here is left completely alone."""
+        """Only reacts for admins (owner or sub-admin) when a broadcast is
+        pending — anything else is left completely alone, for anyone."""
+        if not self.is_admin(update):
+            return
         if not context.user_data.get('broadcast_step'):
             return
         context.user_data.pop('broadcast_step', None)
@@ -1462,7 +1561,7 @@ class SMMBot:
         ], cols=2)
 
         user = update.effective_user
-        if user and user.id == ADMIN_ID:
+        if user and self.is_admin(update):
             keyboard.append([btn("Admin Panel", "adm_panel", emoji="🛡️", style="danger")])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1567,7 +1666,7 @@ If you face any issue with an order or payment, contact support with your <b>Ord
 
     async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if self.is_admin(update):
+        if self.is_owner(update):
             if not self.is_button_update(update):
                 await self.render(update, context, text=f"{pe('⏱️')} Fetching panel balance...")
             result = self.api.get_balance()
@@ -1649,7 +1748,7 @@ Select a category:"""
         page = max(0, min(page, total_pages - 1))
         start, end = page * per_page, min(page * per_page + per_page, len(services))
 
-        admin = self.is_admin(update)
+        admin = self.is_owner(update)
         overrides = {} if admin else await self.store.get_all_service_markups()
         text = f"{pe('📌')} <b>{category}</b> ({len(services)} services)\n\n"
         for service in services[start:end]:
@@ -2252,6 +2351,16 @@ Select a category:"""
             if pct < 0:
                 await self.render(update, context, text=f"{pe('ℹ️')} Markup percentage cannot be negative.")
                 return
+            # Sub-admins can never price a service below +10% over actual cost.
+            # Only the owner (ADMIN_ID) can go lower than that floor.
+            if pct < 10 and not self.is_owner(update):
+                await self.render(
+                    update, context,
+                    text=(f"{pe('ℹ️')} Sub-admins can only set a markup of <b>+10% or more</b>.\n"
+                          f"{pe('ℹ️')} Ask the owner if this service needs a lower margin.")
+                )
+                await self.render_service_pricing(update, context)
+                return
             await self.store.set_service_markup(sid, pct)
             await self.render(update, context, text=f"{pe('✅')} Service <code>{html.escape(str(sid))}</code> now uses +{pct:g}% markup.")
             await self.render_service_pricing(update, context)
@@ -2281,6 +2390,25 @@ Select a category:"""
             await self.render_low_balance_panel(update, context)
             return
 
+        # ---- Owner: add a new sub-admin ----
+        if context.user_data.get('newadmin_step'):
+            context.user_data.pop('newadmin_step', None)
+            if not self.is_owner(update):
+                return  # defensive — only the owner can ever set this flag
+            try:
+                uid = int(user_input.strip())
+            except ValueError:
+                await self.render(update, context, text=f"{pe('ℹ️')} Enter a valid numeric User ID.")
+                return
+            if uid == ADMIN_ID:
+                await self.render(update, context, text=f"{pe('ℹ️')} That user is already the owner.")
+                return
+            await self.store.add_admin(uid, added_by=update.effective_user.id)
+            self.admin_ids.add(uid)
+            await self.render(update, context, text=f"{pe('✅')} User <code>{uid}</code> is now an admin.")
+            await self.render_manage_admins(update, context)
+            return
+
         # ---- Custom payment amount ----
         if context.user_data.get('payment_step') == 'custom':
             try:
@@ -2302,7 +2430,7 @@ Select a category:"""
                 return
             context.user_data['order_service'] = service
             context.user_data['order_step'] = 'link'
-            admin = self.is_admin(update)
+            admin = self.is_owner(update)
             if admin:
                 rate_line = f"Rate/1000: {service.get('rate','N/A')}"
             else:
@@ -2335,7 +2463,7 @@ Select a category:"""
             service = context.user_data.get('order_service', {})
             link = context.user_data.get('order_link')
             real_rate = float(service.get('rate', 0) or 0)
-            admin = self.is_admin(update)
+            admin = self.is_owner(update)
             category = self.categorize(service)
             user_id = update.effective_user.id
             balance = await self.store.get_balance(user_id)
@@ -2574,6 +2702,14 @@ Select a category:"""
         BOT_INSTANCE = self
         BOT_LOOP = asyncio.get_running_loop()
         await self.store.ensure_indexes()
+
+        # Load sub-admins from DB into the in-memory set used by is_admin().
+        try:
+            sub_admin_ids = await self.store.list_admin_ids()
+            self.admin_ids = {ADMIN_ID} | set(sub_admin_ids)
+            logger.info("Loaded %d sub-admin(s) from DB.", len(sub_admin_ids))
+        except Exception as e:
+            logger.error("Could not load sub-admins from DB, continuing with owner only: %s", e)
 
         if app.job_queue:
             app.job_queue.run_repeating(self.check_low_balance_job, interval=1800, first=60)
