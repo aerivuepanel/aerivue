@@ -296,7 +296,9 @@ class Store:
     Collections:
       users          {_id: telegram_user_id, balance, name, username}
       pending        {_id: txn_id, user_id, name, username, amount, utr, screenshot_file_id, created_at}
-      settings       {_id: "config", force_join_enabled, force_join_channels: [{channel, invite_link}, ...]}
+      settings       {_id: "config", force_join_enabled, force_join_channels: [{channel, invite_link}, ...],
+                       low_balance_threshold, low_balance_last_alert}
+      service_pricing {_id: service_id, markup_percent}   # per-service admin price override
     """
     def __init__(self, uri, db_name):
         self.client = AsyncIOMotorClient(uri)
@@ -304,6 +306,7 @@ class Store:
         self.users = self.db.users
         self.pending = self.db.pending_payments
         self.settings = self.db.settings
+        self.service_pricing = self.db.service_pricing
 
     async def ensure_indexes(self):
         await self.users.create_index("_id")
@@ -478,6 +481,35 @@ class Store:
         pipeline = [{"$group": {"_id": None, "total": {"$sum": "$balance"}}}]
         result = await self.users.aggregate(pipeline).to_list(length=1)
         return float(result[0]["total"]) if result else 0.0
+
+    # ---- per-service custom pricing (admin override) ----
+    # If a service has no override here, pricing falls back untouched to the
+    # existing tiered markup system (MARKUP_TIER1/MID/TIER2) — so nothing
+    # changes for services the admin hasn't customized.
+    async def get_service_markup(self, service_id: str):
+        doc = await self.service_pricing.find_one({"_id": str(service_id)})
+        return float(doc["markup_percent"]) if doc else None
+
+    async def get_all_service_markups(self) -> dict:
+        overrides = {}
+        async for doc in self.service_pricing.find({}):
+            overrides[str(doc["_id"])] = float(doc["markup_percent"])
+        return overrides
+
+    async def set_service_markup(self, service_id: str, percent: float):
+        await self.service_pricing.update_one(
+            {"_id": str(service_id)},
+            {"$set": {"markup_percent": float(percent)}},
+            upsert=True,
+        )
+
+    async def remove_service_markup(self, service_id: str):
+        await self.service_pricing.delete_one({"_id": str(service_id)})
+
+    # ---- admin: individual user payment history ----
+    async def get_user_payments(self, uid: int, limit: int = 10):
+        cursor = self.pending.find({"user_id": uid, "status": "credited"}).sort("credited_at", -1).limit(limit)
+        return [doc async for doc in cursor]
 
 # ==================== MAIN BOT ====================
 class SMMBot:
@@ -998,6 +1030,7 @@ class SMMBot:
         end = min(start + per_page, len(services))
 
         admin = self.is_admin(update)
+        overrides = {} if admin else await self.store.get_all_service_markups()
         text = (
             f"{pe('📌')} <b>{label} › {category}</b> "
             f"({len(services)} services)\n\n"
@@ -1017,16 +1050,25 @@ class SMMBot:
                     f"Max: {service.get('max', 'N/A')}\n\n"
                 )
             else:
-                disp_rate = display_rate_per_1000(real_rate, TIER1_MAX_QTY)
-                text += (
-                    f"   {pe('💰')} Rate/1000: ₹{disp_rate:.2f} | "
-                    f"Min: {service.get('min', 'N/A')} | "
-                    f"Max: {service.get('max', 'N/A')}\n"
-                )
-                text += (
-                    f"   {pe('🔥')} Order {TIER2_MIN_QTY:,}+ "
-                    f"for a bulk discount\n\n"
-                )
+                override_pct = overrides.get(str(service.get("service")))
+                if override_pct is not None:
+                    disp_rate = round(real_rate * (1 + override_pct / 100), 4)
+                    text += (
+                        f"   {pe('💰')} Rate/1000: ₹{disp_rate:.2f} | "
+                        f"Min: {service.get('min', 'N/A')} | "
+                        f"Max: {service.get('max', 'N/A')}\n\n"
+                    )
+                else:
+                    disp_rate = display_rate_per_1000(real_rate, TIER1_MAX_QTY)
+                    text += (
+                        f"   {pe('💰')} Rate/1000: ₹{disp_rate:.2f} | "
+                        f"Min: {service.get('min', 'N/A')} | "
+                        f"Max: {service.get('max', 'N/A')}\n"
+                    )
+                    text += (
+                        f"   {pe('🔥')} Order {TIER2_MIN_QTY:,}+ "
+                        f"for a bulk discount\n\n"
+                    )
 
         nav_row = []
         if page > 0:
@@ -1101,6 +1143,7 @@ class SMMBot:
         settings = await self.store.get_settings()
         fj_on = bool(settings.get("force_join_enabled", False))
         channels = settings.get("force_join_channels") or []
+        threshold = float(settings.get("low_balance_threshold", 0) or 0)
 
         keyboard = grid([
             btn(f"Force Join: {'ON' if fj_on else 'OFF'}", "adm_fjtoggle",
@@ -1108,6 +1151,9 @@ class SMMBot:
             btn(f"Manage Channels ({len(channels)})", "adm_fjmanage", emoji="📌"),
             btn("Broadcast", "adm_broadcast", emoji="📤", style="primary"),
             btn("Stats", "adm_stats", emoji="📊", style="primary"),
+            btn("Service Pricing", "adm_pricing", emoji="💰", style="primary"),
+            btn("User Lookup", "adm_userlookup", emoji="👤", style="primary"),
+            btn(f"Low Balance: {'ON' if threshold > 0 else 'OFF'}", "adm_lowbal", emoji="ℹ️", style="primary"),
         ], cols=2)
         keyboard.append([btn("Main Menu", "menu", emoji="🔑")])
 
@@ -1115,6 +1161,7 @@ class SMMBot:
 
 {pe('📌')} Force Join: <b>{'ON' if fj_on else 'OFF'}</b>
 {pe('🌐')} Channels added: <b>{len(channels)}</b>
+{pe('💰')} Low Balance Alert: <b>{'₹' + f'{threshold:.2f}' if threshold > 0 else 'OFF'}</b>
 
 {pe('ℹ️')} Choose an option:"""
         await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1139,6 +1186,70 @@ class SMMBot:
 {listing}
 
 {pe('ℹ️')} Users must join ALL of these to use the bot when Force Join is ON."""
+        await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # ---- Per-service custom pricing ----
+    async def render_service_pricing(self, update, context):
+        overrides = await self.store.get_all_service_markups()
+        items = sorted(overrides.items(), key=lambda x: x[0])
+
+        keyboard = []
+        for i, (sid, pct) in enumerate(items):
+            keyboard.append([btn(f"❌ #{sid} — +{pct:g}%", f"adm_pricerm_{i}", emoji="🛡️", style="danger")])
+        keyboard.append([btn("Add / Edit Override", "adm_priceadd", emoji="💰", style="success")])
+        keyboard.append([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")])
+
+        if items:
+            listing = "\n".join(f"{i + 1}. Service <code>{html.escape(sid)}</code> → +{pct:g}%" for i, (sid, pct) in enumerate(items))
+        else:
+            listing = f"{pe('ℹ️')} No custom pricing set yet — every service uses the default tiered markup."
+
+        text = f"""{pe('💰')} <b>Per-Service Pricing</b> ({len(items)} custom)
+
+{listing}
+
+{pe('ℹ️')} Services without an override keep the default tiered markup (+50% / +40% / +30% by quantity). Setting an override here replaces that with a single fixed % for that service only."""
+        await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # ---- Admin: individual user lookup ----
+    async def render_user_lookup(self, update, context, uid: int):
+        balance = await self.store.get_balance(uid)
+        payments = await self.store.get_user_payments(uid, limit=10)
+
+        text = f"""{pe('👤')} <b>User Lookup — {uid}</b>
+
+{pe('💰')} Balance: ₹{balance:.2f}
+{pe('📝')} Recent Payments ({len(payments)}):
+"""
+        if payments:
+            for p in payments:
+                credited_at = p.get('credited_at')
+                when = credited_at.strftime('%Y-%m-%d %H:%M') if credited_at else 'N/A'
+                pay_id = p.get('razorpay_payment_id', 'N/A')
+                text += f"\n{pe('🆔')} ₹{float(p.get('amount', 0)):.2f} — {when} (<code>{html.escape(str(pay_id))}</code>)"
+        else:
+            text += f"\n{pe('ℹ️')} No completed payments found for this user."
+
+        await self.render(
+            update, context, text=text,
+            reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
+        )
+
+    # ---- Admin: low balance alert threshold ----
+    async def render_low_balance_panel(self, update, context):
+        settings = await self.store.get_settings()
+        threshold = float(settings.get("low_balance_threshold", 0) or 0)
+
+        text = f"""{pe('ℹ️')} <b>Low Balance Alerts</b>
+
+{pe('💰')} Current threshold: <b>{'Disabled' if threshold <= 0 else f'₹{threshold:.2f}'}</b>
+
+{pe('ℹ️')} You'll get a message here (at most once every 3 hours) whenever the SMM panel balance drops below this amount."""
+        keyboard = grid([
+            btn("Set Threshold", "adm_lowbalset", emoji="💰", style="primary"),
+            btn("Disable", "adm_lowbaloff", emoji="🛡️", style="danger"),
+        ], cols=2)
+        keyboard.append([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")])
         await self.render(update, context, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def admin_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1219,6 +1330,52 @@ class SMMBot:
                 update, context, text=f"{pe('ℹ️')} Broadcast cancelled.",
                 reply_markup=InlineKeyboardMarkup(grid([btn("‹ Admin Panel", "adm_panel", emoji="🛡️")], cols=1))
             )
+            return
+
+        if data == "adm_pricing":
+            await self.render_service_pricing(update, context)
+            return
+
+        if data == "adm_priceadd":
+            context.user_data['price_step'] = 'id'
+            await self.render(
+                update, context,
+                text=f"{pe('🆔')} Send the Service ID to set a custom price for (e.g. <code>5137</code>)."
+            )
+            return
+
+        if data.startswith("adm_pricerm_"):
+            try:
+                idx = int(data.rsplit("_", 1)[1])
+            except ValueError:
+                idx = -1
+            overrides = await self.store.get_all_service_markups()
+            items = sorted(overrides.items(), key=lambda x: x[0])
+            if 0 <= idx < len(items):
+                await self.store.remove_service_markup(items[idx][0])
+            await self.render_service_pricing(update, context)
+            return
+
+        if data == "adm_userlookup":
+            context.user_data['userlookup_step'] = True
+            await self.render(update, context, text=f"{pe('👤')} Send the numeric Telegram User ID to look up.")
+            return
+
+        if data == "adm_lowbal":
+            await self.render_low_balance_panel(update, context)
+            return
+
+        if data == "adm_lowbalset":
+            context.user_data['lowbal_step'] = True
+            await self.render(
+                update, context,
+                text=f"{pe('💰')} Enter the balance threshold (a number). Alert fires when the panel balance drops below this."
+            )
+            return
+
+        if data == "adm_lowbaloff":
+            await self.store.update_settings({"low_balance_threshold": 0})
+            await self.render_low_balance_panel(update, context)
             return
 
     async def handle_admin_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1493,6 +1650,7 @@ Select a category:"""
         start, end = page * per_page, min(page * per_page + per_page, len(services))
 
         admin = self.is_admin(update)
+        overrides = {} if admin else await self.store.get_all_service_markups()
         text = f"{pe('📌')} <b>{category}</b> ({len(services)} services)\n\n"
         for service in services[start:end]:
             real_rate = float(service.get('rate', 0) or 0)
@@ -1500,9 +1658,14 @@ Select a category:"""
             if admin:
                 text += f"   {pe('💰')} Rate/1000: {service.get('rate', 'N/A')} | Min: {service.get('min', 'N/A')} | Max: {service.get('max', 'N/A')}\n\n"
             else:
-                disp_rate = display_rate_per_1000(real_rate, TIER1_MAX_QTY)
-                text += f"   {pe('💰')} Rate/1000: ₹{disp_rate:.2f} | Min: {service.get('min', 'N/A')} | Max: {service.get('max', 'N/A')}\n"
-                text += f"   {pe('🔥')} Order {TIER2_MIN_QTY:,}+ for a bulk discount\n\n"
+                override_pct = overrides.get(str(service.get("service")))
+                if override_pct is not None:
+                    disp_rate = round(real_rate * (1 + override_pct / 100), 4)
+                    text += f"   {pe('💰')} Rate/1000: ₹{disp_rate:.2f} | Min: {service.get('min', 'N/A')} | Max: {service.get('max', 'N/A')}\n\n"
+                else:
+                    disp_rate = display_rate_per_1000(real_rate, TIER1_MAX_QTY)
+                    text += f"   {pe('💰')} Rate/1000: ₹{disp_rate:.2f} | Min: {service.get('min', 'N/A')} | Max: {service.get('max', 'N/A')}\n"
+                    text += f"   {pe('🔥')} Order {TIER2_MIN_QTY:,}+ for a bulk discount\n\n"
 
         nav_row = []
         if page > 0:
@@ -2065,6 +2228,59 @@ Select a category:"""
             await self.render_broadcast_preview(update, context)
             return
 
+        # ---- Admin: per-service custom pricing (step 1: service id) ----
+        if context.user_data.get('price_step') == 'id':
+            context.user_data['price_service_id'] = user_input.strip()
+            context.user_data['price_step'] = 'pct'
+            await self.render(
+                update, context,
+                text=(f"{pe('💰')} Enter the markup percentage to add for this service "
+                      f"(e.g. <code>45</code> for +45%). This replaces the default tiered "
+                      f"markup for this service only.")
+            )
+            return
+
+        # ---- Admin: per-service custom pricing (step 2: percentage) ----
+        if context.user_data.get('price_step') == 'pct':
+            sid = context.user_data.pop('price_service_id', None)
+            context.user_data.pop('price_step', None)
+            try:
+                pct = float(user_input.strip())
+            except ValueError:
+                await self.render(update, context, text=f"{pe('ℹ️')} Enter a valid number (e.g. 45 or 32.5).")
+                return
+            if pct < 0:
+                await self.render(update, context, text=f"{pe('ℹ️')} Markup percentage cannot be negative.")
+                return
+            await self.store.set_service_markup(sid, pct)
+            await self.render(update, context, text=f"{pe('✅')} Service <code>{html.escape(str(sid))}</code> now uses +{pct:g}% markup.")
+            await self.render_service_pricing(update, context)
+            return
+
+        # ---- Admin: user lookup ----
+        if context.user_data.get('userlookup_step'):
+            context.user_data.pop('userlookup_step', None)
+            try:
+                uid = int(user_input.strip())
+            except ValueError:
+                await self.render(update, context, text=f"{pe('ℹ️')} Enter a valid numeric User ID.")
+                return
+            await self.render_user_lookup(update, context, uid)
+            return
+
+        # ---- Admin: low balance alert threshold ----
+        if context.user_data.get('lowbal_step'):
+            context.user_data.pop('lowbal_step', None)
+            try:
+                threshold = float(user_input.strip())
+            except ValueError:
+                await self.render(update, context, text=f"{pe('ℹ️')} Enter a valid number.")
+                return
+            await self.store.update_settings({"low_balance_threshold": max(0.0, threshold)})
+            await self.render(update, context, text=f"{pe('✅')} Low balance threshold set to ₹{max(0.0, threshold):.2f}.")
+            await self.render_low_balance_panel(update, context)
+            return
+
         # ---- Custom payment amount ----
         if context.user_data.get('payment_step') == 'custom':
             try:
@@ -2087,8 +2303,15 @@ Select a category:"""
             context.user_data['order_service'] = service
             context.user_data['order_step'] = 'link'
             admin = self.is_admin(update)
-            rate_line = (f"Rate/1000: {service.get('rate','N/A')}" if admin
-                         else f"Rate/1000: ₹{display_rate_per_1000(float(service.get('rate', 0) or 0), TIER1_MAX_QTY):.2f}")
+            if admin:
+                rate_line = f"Rate/1000: {service.get('rate','N/A')}"
+            else:
+                real_rate = float(service.get('rate', 0) or 0)
+                override_pct = await self.store.get_service_markup(str(service.get('service')))
+                if override_pct is not None:
+                    rate_line = f"Rate/1000: ₹{round(real_rate * (1 + override_pct / 100), 4):.2f}"
+                else:
+                    rate_line = f"Rate/1000: ₹{display_rate_per_1000(real_rate, TIER1_MAX_QTY):.2f}"
             await self.render(
                 update, context,
                 text=f"{pe('📦')} <b>{service.get('name','Unknown')[:60]}</b>\n"
@@ -2121,9 +2344,14 @@ Select a category:"""
             if admin:
                 cost = round(real_rate / 1000 * quantity, 2)
             else:
-                cost, base_rate, tiered_rate, discounted, savings_pct = compute_cost(real_rate, quantity)
-                if discounted:
-                    discount_line = f"\n{pe('🔥')} Bulk discount applied — {savings_pct}% cheaper than list rate!"
+                override_pct = await self.store.get_service_markup(str(service.get('service')))
+                if override_pct is not None:
+                    tiered_rate = round(real_rate * (1 + override_pct / 100), 4)
+                    cost = round(tiered_rate / 1000 * quantity, 2)
+                else:
+                    cost, base_rate, tiered_rate, discounted, savings_pct = compute_cost(real_rate, quantity)
+                    if discounted:
+                        discount_line = f"\n{pe('🔥')} Bulk discount applied — {savings_pct}% cheaper than list rate!"
 
             for k in ('order_step', 'order_service', 'order_link'):
                 context.user_data.pop(k, None)
@@ -2293,12 +2521,67 @@ Select a category:"""
         _, cat_index, page = query.data.split("_")
         await self.show_category_services(update, context, int(cat_index), int(page))
 
+    # ==================== LOW BALANCE ALERT (background job) ====================
+    async def check_low_balance_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Runs periodically. No-op unless the admin has set a threshold > 0,
+        so this has zero effect on anything until explicitly configured."""
+        settings = await self.store.get_settings()
+        threshold = float(settings.get("low_balance_threshold", 0) or 0)
+        if threshold <= 0:
+            return
+
+        result = self.api.get_balance()
+        if not result or 'balance' not in result:
+            return
+        try:
+            balance = float(result['balance'])
+        except (TypeError, ValueError):
+            return
+        if balance >= threshold:
+            return
+
+        # Cooldown so the admin isn't spammed every job run.
+        last_alert = settings.get("low_balance_last_alert")
+        now = datetime.now(timezone.utc)
+        if last_alert:
+            try:
+                if last_alert.tzinfo is None:
+                    last_alert = last_alert.replace(tzinfo=timezone.utc)
+                elapsed = (now - last_alert).total_seconds()
+            except Exception:
+                elapsed = 999999
+            if elapsed < 3 * 3600:
+                return
+
+        await self.store.update_settings({"low_balance_last_alert": now})
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"{pe('ℹ️')} <b>Low Panel Balance Alert</b>\n\n"
+                    f"{pe('💰')} Current Balance: {result['balance']} {result.get('currency', 'USD')}\n"
+                    f"{pe('ℹ️')} Threshold: ₹{threshold:.2f}\n\n"
+                    f"Please top up your SMM panel balance."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error("Could not send low balance alert: %s", e)
+
     # ==================== RUN ====================
     async def _post_init(self, app):
         global BOT_INSTANCE, BOT_LOOP
         BOT_INSTANCE = self
         BOT_LOOP = asyncio.get_running_loop()
         await self.store.ensure_indexes()
+
+        if app.job_queue:
+            app.job_queue.run_repeating(self.check_low_balance_job, interval=1800, first=60)
+        else:
+            logger.warning(
+                "JobQueue not available — install with `pip install \"python-telegram-bot[job-queue]\"` "
+                "to enable low balance alerts. Everything else is unaffected."
+            )
 
     def run(self):
         required = {
